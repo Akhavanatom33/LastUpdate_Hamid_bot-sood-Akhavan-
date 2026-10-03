@@ -661,9 +661,34 @@ def init_db():
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS force_join_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id TEXT NOT NULL,
+                title TEXT,
+                link TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS bot_admins (
+                user_id INTEGER PRIMARY KEY,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_akhavan_ledger_order
             ON akhavan_profit_ledger(order_id)
             WHERE order_id IS NOT NULL;
+
+            CREATE INDEX IF NOT EXISTS idx_force_join_order
+            ON force_join_channels(sort_order);
 
             CREATE INDEX IF NOT EXISTS idx_orders_user
             ON orders(user_id);
@@ -914,6 +939,94 @@ def init_db():
                 logger.exception(
                     "Failed migrating legacy admin session"
                 )
+
+        # ──────────────────────────────────────────────────────────────────
+        # Seed force-join channels from legacy ENV vars (one-time, only if
+        # the table is still empty) so upgrades keep working without any
+        # manual admin action right after deploy.
+        # ──────────────────────────────────────────────────────────────────
+
+        try:
+            existing_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM force_join_channels"
+            ).fetchone()["c"]
+        except Exception:
+            existing_count = 0
+
+        if existing_count == 0 and CHANNEL_IDS:
+            for i, channel_id in enumerate(CHANNEL_IDS):
+                link = (
+                    CHANNEL_LINKS[i]
+                    if i < len(CHANNEL_LINKS)
+                    else None
+                )
+                label = (
+                    CHANNEL_LABELS[i]
+                    if i < len(CHANNEL_LABELS)
+                    else f"کانال {i + 1}"
+                )
+
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO force_join_channels(
+                            chat_id,
+                            title,
+                            link,
+                            sort_order,
+                            added_by,
+                            created_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            str(channel_id),
+                            label,
+                            link,
+                            i,
+                            None,
+                            now()
+                        )
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed seeding force-join channel from ENV: %s",
+                        channel_id
+                    )
+
+        try:
+            has_setting = conn.execute(
+                "SELECT 1 FROM bot_settings WHERE key='force_join_enabled'"
+            ).fetchone()
+        except Exception:
+            has_setting = None
+
+        if not has_setting:
+            conn.execute(
+                """
+                INSERT INTO bot_settings(key, value, updated_at)
+                VALUES ('force_join_enabled', '1', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (now(),)
+            )
+
+        try:
+            has_maintenance = conn.execute(
+                "SELECT 1 FROM bot_settings WHERE key='maintenance_mode'"
+            ).fetchone()
+        except Exception:
+            has_maintenance = None
+
+        if not has_maintenance:
+            conn.execute(
+                """
+                INSERT INTO bot_settings(key, value, updated_at)
+                VALUES ('maintenance_mode', '0', ?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (now(),)
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1903,17 +2016,203 @@ def main_menu_inline():
     return kb
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# BOT SETTINGS (key/value, persisted in DB)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_setting(key, default=None):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_settings WHERE key=?",
+            (key,)
+        ).fetchone()
+
+    if not row:
+        return default
+
+    return row["value"]
+
+
+def set_setting(key, value):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_settings(key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (key, str(value), now())
+        )
+
+
+def is_force_join_enabled():
+    return get_setting("force_join_enabled", "1") == "1"
+
+
+def set_force_join_enabled(flag):
+    set_setting("force_join_enabled", "1" if flag else "0")
+
+
+def is_maintenance_mode():
+    return get_setting("maintenance_mode", "0") == "1"
+
+
+def set_maintenance_mode(flag):
+    set_setting("maintenance_mode", "1" if flag else "0")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FORCE JOIN CHANNELS (📢 عضویت اجباری — managed from the admin panel)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _normalize_chat_id(raw):
+    raw = str(raw).strip()
+
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+
+    return raw
+
+
+def get_force_join_channels():
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM force_join_channels
+            ORDER BY sort_order ASC, id ASC
+            """
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def add_force_join_channel(chat_id, title, link, added_by=None):
+    with db() as conn:
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) AS m FROM force_join_channels"
+        ).fetchone()["m"]
+
+        conn.execute(
+            """
+            INSERT INTO force_join_channels(
+                chat_id,
+                title,
+                link,
+                sort_order,
+                added_by,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(chat_id),
+                title,
+                link,
+                max_order + 1,
+                added_by,
+                now()
+            )
+        )
+
+
+def remove_force_join_channel(channel_row_id):
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM force_join_channels WHERE id=?",
+            (channel_row_id,)
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DYNAMIC ADMINS (🧑‍💼 مدیریت ادمین‌ها — اضافه/حذف ادمین بدون ریستارت ربات)
+# ══════════════════════════════════════════════════════════════════════════════
+
+ENV_ADMIN_ID_ORDER = tuple(ADMIN_ID_LIST)
+ENV_ADMIN_IDS = frozenset(ENV_ADMIN_ID_ORDER)
+
+
+def get_extra_admin_ids():
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                "SELECT user_id FROM bot_admins ORDER BY created_at ASC"
+            ).fetchall()
+    except Exception:
+        return []
+
+    return [row["user_id"] for row in rows]
+
+
+def reload_admin_ids():
+    """ADMIN_IDS/ADMIN_ID_LIST را با ادمین‌های اضافه‌شده از پنل هماهنگ می‌کند.
+
+    چون ADMIN_IDS همان‌جا (in-place) آپدیت می‌شود، همه‌ی توابعی که از قبل
+    به آن ارجاع دارند بدون نیاز به ریستارت ربات مقدار تازه را می‌بینند.
+    """
+
+    extra = get_extra_admin_ids()
+
+    ordered = []
+
+    for admin_id in ENV_ADMIN_ID_ORDER:
+        if admin_id not in ordered:
+            ordered.append(admin_id)
+
+    for admin_id in extra:
+        if admin_id not in ordered:
+            ordered.append(admin_id)
+
+    ADMIN_ID_LIST[:] = ordered
+
+    ADMIN_IDS.clear()
+    ADMIN_IDS.update(ordered)
+
+
+def add_extra_admin(user_id, added_by=None):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO bot_admins(user_id, added_by, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO NOTHING
+            """,
+            (user_id, added_by, now())
+        )
+
+    reload_admin_ids()
+
+
+def remove_extra_admin(user_id):
+    with db() as conn:
+        conn.execute(
+            "DELETE FROM bot_admins WHERE user_id=?",
+            (user_id,)
+        )
+
+    reload_admin_ids()
+
+
 def join_keyboard():
     kb = types.InlineKeyboardMarkup(
         row_width=1
     )
 
-    for i, link in enumerate(CHANNEL_LINKS):
-        label = (
-            CHANNEL_LABELS[i]
-            if i < len(CHANNEL_LABELS)
-            else f"عضویت در کانال {i + 1}"
-        )
+    for i, channel in enumerate(get_force_join_channels()):
+        label = channel.get("title") or f"عضویت در کانال {i + 1}"
+        link = channel.get("link")
+
+        if not link:
+            raw_chat_id = channel.get("chat_id") or ""
+
+            if str(raw_chat_id).startswith("@"):
+                link = f"https://t.me/{str(raw_chat_id)[1:]}"
+
+        if not link:
+            # بدون لینک معتبر نمی‌شود دکمه URL ساخت؛ از این کانال صرف‌نظر می‌شود.
+            continue
 
         kb.add(
             types.InlineKeyboardButton(
@@ -1937,10 +2236,22 @@ def join_keyboard():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def is_member(user_id):
-    if not CHANNEL_IDS:
+    if user_id in ADMIN_IDS:
         return True
 
-    for channel_id in CHANNEL_IDS:
+    if not is_force_join_enabled():
+        return True
+
+    channels = get_force_join_channels()
+
+    if not channels:
+        return True
+
+    for channel in channels:
+        channel_id = _normalize_chat_id(
+            channel["chat_id"]
+        )
+
         try:
             member = bot.get_chat_member(
                 channel_id,
@@ -1983,6 +2294,17 @@ def ensure_joined(message):
     ensure_user(
         message.from_user
     )
+
+    if (
+        is_maintenance_mode()
+        and message.from_user.id not in ADMIN_IDS
+    ):
+        bot.send_message(
+            message.chat.id,
+            "🛠 ربات موقتاً در حال به‌روزرسانی است. لطفاً چند دقیقه دیگر دوباره تلاش کنید."
+        )
+
+        return False
 
     if is_member(
         message.from_user.id
@@ -3647,22 +3969,25 @@ def _record_akhavan_profit(conn, order):
 
 
 def _notify_akhavan_profit(entry):
-    if not PROFIT_ADMIN_ID:
-        return
+    # این پیام حالا برای همه‌ی ادمین‌ها ارسال می‌شود چون «💐 سود اخوان»
+    # دیگر مخصوص یک ادمین خاص نیست.
+    recipients = set(ADMIN_IDS) | ({PROFIT_ADMIN_ID} if PROFIT_ADMIN_ID else set())
 
-    try:
-        bot.send_message(
-            PROFIT_ADMIN_ID,
-            "🌹 <b>سود جدید ثبت شد</b>\n\n"
-            f"🛍 سفارش #{entry['order_id']} — {esc(entry['product_title'])}\n"
-            f"➕ سود این خرید: <b>{money(entry['profit'])}</b>\n\n"
-            f"🌸 سود شما بعد از این خرید <b>{money(entry['balance'])}</b> شد 🌺"
-        )
+    for admin_id in recipients:
+        try:
+            bot.send_message(
+                admin_id,
+                "🌹 <b>سود جدید ثبت شد</b>\n\n"
+                f"🛍 سفارش #{entry['order_id']} — {esc(entry['product_title'])}\n"
+                f"➕ سود این خرید: <b>{money(entry['profit'])}</b>\n\n"
+                f"🌸 سود مجموعه بعد از این خرید <b>{money(entry['balance'])}</b> شد 🌺"
+            )
 
-    except Exception:
-        logger.exception(
-            "Failed sending Akhavan profit notification"
-        )
+        except Exception:
+            logger.exception(
+                "Failed sending Akhavan profit notification to %s",
+                admin_id
+            )
 
 
 def complete_order(order_id):
@@ -5661,15 +5986,28 @@ def admin_panel_keyboard(admin_id=None):
         types.InlineKeyboardButton(
             "💲 تغییر قیمت سرویس‌ها",
             callback_data="admin:prices"
+        ),
+        types.InlineKeyboardButton(
+            "🔐 عضویت اجباری",
+            callback_data="admin:forcejoin"
         )
     )
 
-    # بخش سود فقط برای اخوان (ادمین اول) نمایش داده می‌شود.
-    if (
-        admin_id is not None
-        and PROFIT_ADMIN_ID is not None
-        and admin_id == PROFIT_ADMIN_ID
-    ):
+    maintenance_on = is_maintenance_mode()
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🧑‍💼 مدیریت ادمین‌ها",
+            callback_data="admin:admins"
+        ),
+        types.InlineKeyboardButton(
+            "🛠 خاموش کردن ربات" if not maintenance_on else "✅ روشن کردن ربات",
+            callback_data="admin:maintenance_toggle"
+        )
+    )
+
+    # 💐 سود اخوان حالا برای همه‌ی ادمین‌ها نمایش داده می‌شود.
+    if admin_id is not None and admin_id in ADMIN_IDS:
         kb.row(
             types.InlineKeyboardButton(
                 "💐 سود اخوان",
@@ -11388,6 +11726,9 @@ def restore_database_from_file(path):
     # قیمت‌های دیتابیس بازگردانی‌شده روی محصولات اعمال شود.
     load_price_overrides()
 
+    # ادمین‌های اضافه‌شده از پنل در دیتابیس بازگردانی‌شده هم اعمال شوند.
+    reload_admin_ids()
+
 
 @bot.callback_query_handler(
     func=lambda c: c.data == "admin:db_backup"
@@ -11772,6 +12113,511 @@ def cb_admin_db_restore_yes(call):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: FORCE JOIN (🔐 عضویت اجباری)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def admin_forcejoin_text():
+    channels = get_force_join_channels()
+    enabled = is_force_join_enabled()
+
+    lines = [
+        "🔐 <b>عضویت اجباری</b>",
+        "",
+        "ربات باید در کانال‌هایی که اینجا اضافه می‌کنید عضو (و ترجیحاً ادمین) باشد. "
+        "کاربر تا وقتی عضو همه‌ی این کانال‌ها نشود، نمی‌تواند از ربات استفاده کند.",
+        "",
+        f"وضعیت فعلی: {'✅ فعال' if enabled else '❌ غیرفعال'}"
+    ]
+
+    if not channels:
+        lines.append("\nهیچ کانالی ثبت نشده است. با «➕ افزودن کانال» شروع کنید.")
+    else:
+        lines.append("\n📋 کانال‌های فعلی:")
+
+        for i, channel in enumerate(channels, start=1):
+            lines.append(
+                f"{i}. {esc(channel.get('title') or channel['chat_id'])}"
+            )
+
+    return "\n".join(lines)
+
+
+def admin_forcejoin_keyboard():
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    for channel in get_force_join_channels():
+        title = channel.get("title") or str(channel["chat_id"])
+
+        kb.add(
+            types.InlineKeyboardButton(
+                f"🗑 حذف «{title}»",
+                callback_data=f"admin:fj_del:{channel['id']}"
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "➕ افزودن کانال",
+            callback_data="admin:fj_add"
+        )
+    )
+
+    enabled = is_force_join_enabled()
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "❌ غیرفعال‌سازی عضویت اجباری" if enabled else "✅ فعال‌سازی عضویت اجباری",
+            callback_data="admin:fj_toggle"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:forcejoin"
+)
+def cb_admin_forcejoin(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    clear_admin_state(
+        call.from_user.id
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    edit_or_send(
+        call,
+        admin_forcejoin_text(),
+        admin_forcejoin_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:fj_toggle"
+)
+def cb_admin_fj_toggle(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    set_force_join_enabled(
+        not is_force_join_enabled()
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "وضعیت عضویت اجباری تغییر کرد ✅"
+    )
+
+    edit_or_send(
+        call,
+        admin_forcejoin_text(),
+        admin_forcejoin_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:fj_del:")
+)
+def cb_admin_fj_delete(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        channel_row_id = int(call.data.split(":")[-1])
+    except ValueError:
+        bot.answer_callback_query(call.id, "نامعتبر.", show_alert=True)
+        return
+
+    remove_force_join_channel(
+        channel_row_id
+    )
+
+    bot.answer_callback_query(
+        call.id,
+        "کانال حذف شد ✅"
+    )
+
+    edit_or_send(
+        call,
+        admin_forcejoin_text(),
+        admin_forcejoin_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:fj_add"
+)
+def cb_admin_fj_add(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "forcejoin_add",
+        {}
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data="admin:forcejoin"
+        )
+    )
+
+    edit_or_send(
+        call,
+        "➕ <b>افزودن کانال عضویت اجباری</b>\n\n"
+        "ربات را ابتدا در کانال موردنظر <b>ادمین</b> کنید، سپس یکی از راه‌های زیر را انجام دهید:\n\n"
+        "1️⃣ یک پیام از همان کانال را اینجا <b>فوروارد</b> کنید.\n"
+        "2️⃣ یا یوزرنیم کانال را با @ بفرستید (مثال: <code>@mychannel</code>).\n"
+        "3️⃣ یا آیدی عددی کانال را بفرستید (مثال: <code>-1001234567890</code>).\n\n"
+        "برای لغو /cancel بفرستید.",
+        kb
+    )
+
+
+def _resolve_force_join_source(message):
+    if getattr(message, "forward_from_chat", None) is not None:
+        return message.forward_from_chat.id
+
+    if message.content_type != "text":
+        return None
+
+    raw = (message.text or "").strip()
+
+    if not raw:
+        return None
+
+    if raw.lstrip("-").isdigit():
+        return int(raw)
+
+    if raw.startswith("@"):
+        return raw
+
+    if "t.me/" in raw:
+        username = raw.split("t.me/")[-1].strip("/").split("?")[0]
+
+        if username:
+            return f"@{username}"
+
+    return None
+
+
+def handle_forcejoin_add_message(message):
+    admin_id = message.from_user.id
+    chat_ref = _resolve_force_join_source(message)
+
+    if chat_ref is None:
+        bot.send_message(
+            message.chat.id,
+            "❌ متوجه نشدم. یک پیام از کانال فوروارد کنید، یا یوزرنیم/آیدی عددی "
+            "کانال را بفرستید؛ یا /cancel بفرستید."
+        )
+        return
+
+    try:
+        chat = bot.get_chat(chat_ref)
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "❌ کانال پیدا نشد. مطمئن شوید ربات قبلاً به آن کانال اضافه شده "
+            "و دوباره تلاش کنید، یا /cancel بفرستید."
+        )
+        return
+
+    try:
+        me = bot.get_me()
+        bot_member = bot.get_chat_member(chat.id, me.id)
+
+        if bot_member.status not in ("administrator", "creator"):
+            bot.send_message(
+                message.chat.id,
+                "⚠️ ربات در این کانال عضو است ولی <b>ادمین</b> نیست. "
+                "لطفاً ربات را ادمین کانال کنید و دوباره همین پیام را بفرستید.",
+                parse_mode="HTML"
+            )
+            return
+
+    except Exception:
+        bot.send_message(
+            message.chat.id,
+            "❌ ربات در این کانال عضو نیست. اول ربات را به کانال اضافه و ادمین کنید، "
+            "سپس دوباره تلاش کنید."
+        )
+        return
+
+    link = None
+
+    if getattr(chat, "username", None):
+        link = f"https://t.me/{chat.username}"
+    else:
+        try:
+            link = bot.export_chat_invite_link(chat.id)
+        except Exception:
+            link = None
+
+    title = (
+        getattr(chat, "title", None)
+        or (f"@{chat.username}" if getattr(chat, "username", None) else str(chat.id))
+    )
+
+    add_force_join_channel(
+        chat.id,
+        title,
+        link,
+        added_by=admin_id
+    )
+
+    clear_admin_state(admin_id)
+
+    note = "" if link else "\n⚠️ لینک عمومی پیدا نشد؛ کاربران فقط با «بررسی عضویت» چک می‌شوند."
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ کانال «{esc(title)}» به لیست عضویت اجباری اضافه شد.{note}",
+        reply_markup=admin_forcejoin_keyboard()
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: MAINTENANCE MODE (🛠 خاموش/روشن کردن ربات)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:maintenance_toggle"
+)
+def cb_admin_maintenance_toggle(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    new_state = not is_maintenance_mode()
+    set_maintenance_mode(new_state)
+
+    bot.answer_callback_query(
+        call.id,
+        "🛠 ربات خاموش شد (فقط ادمین‌ها دسترسی دارند)." if new_state else "✅ ربات دوباره روشن شد."
+    )
+
+    edit_or_send(
+        call,
+        "🛠 <b>پنل مدیریت</b>\n\n"
+        "بخش موردنظر را انتخاب کنید:",
+        admin_panel_keyboard(call.from_user.id)
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: ADMINS MANAGEMENT (🧑‍💼 مدیریت ادمین‌ها)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def admin_admins_text():
+    lines = [
+        "🧑‍💼 <b>مدیریت ادمین‌ها</b>",
+        "",
+        "لیست فعلی ادمین‌های ربات:",
+        ""
+    ]
+
+    for admin_id in ADMIN_ID_LIST:
+        origin = "پایه (ENV)" if admin_id in ENV_ADMIN_IDS else "افزوده‌شده از پنل"
+        star = " 🌹" if admin_id == PROFIT_ADMIN_ID else ""
+
+        lines.append(f"• <code>{admin_id}</code> — {origin}{star}")
+
+    lines.append(
+        "\nℹ️ ادمین‌های «پایه» فقط از طریق متغیر محیطی ADMIN_IDS قابل حذف هستند."
+    )
+
+    return "\n".join(lines)
+
+
+def admin_admins_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    for admin_id in ADMIN_ID_LIST:
+        if admin_id in ENV_ADMIN_IDS:
+            continue
+
+        kb.add(
+            types.InlineKeyboardButton(
+                f"🗑 حذف ادمین {admin_id}",
+                callback_data=f"admin:adm_del:{admin_id}"
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "➕ افزودن ادمین جدید",
+            callback_data="admin:adm_add"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:admins"
+)
+def cb_admin_admins(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    clear_admin_state(call.from_user.id)
+
+    bot.answer_callback_query(call.id)
+
+    edit_or_send(
+        call,
+        admin_admins_text(),
+        admin_admins_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:adm_add"
+)
+def cb_admin_adm_add(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "admin_add_wait_id",
+        {}
+    )
+
+    bot.answer_callback_query(call.id)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data="admin:admins"
+        )
+    )
+
+    edit_or_send(
+        call,
+        "➕ <b>افزودن ادمین جدید</b>\n\n"
+        "آیدی عددی کاربر را بفرستید (کاربر باید حداقل یک‌بار ربات را استارت "
+        "کرده باشد تا آیدی او برای شما قابل پیدا کردن باشد).\n\n"
+        "برای لغو /cancel بفرستید.",
+        kb
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:adm_del:")
+)
+def cb_admin_adm_delete(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        target_id = int(call.data.split(":")[-1])
+    except ValueError:
+        bot.answer_callback_query(call.id, "نامعتبر.", show_alert=True)
+        return
+
+    if target_id in ENV_ADMIN_IDS:
+        bot.answer_callback_query(
+            call.id,
+            "این ادمین پایه است و از پنل قابل حذف نیست.",
+            show_alert=True
+        )
+        return
+
+    remove_extra_admin(target_id)
+
+    bot.answer_callback_query(
+        call.id,
+        "ادمین حذف شد ✅"
+    )
+
+    edit_or_send(
+        call,
+        admin_admins_text(),
+        admin_admins_keyboard()
+    )
+
+
+def handle_admin_add_message(message):
+    admin_id = message.from_user.id
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "لطفاً فقط آیدی عددی را به صورت متن ارسال کنید."
+        )
+        return
+
+    raw = (message.text or "").translate(DIGIT_TRANSLATION).strip()
+
+    if not raw.lstrip("-").isdigit():
+        bot.send_message(
+            message.chat.id,
+            "❌ آیدی نامعتبر است. فقط عدد بفرستید یا /cancel بزنید."
+        )
+        return
+
+    target_id = int(raw)
+
+    if target_id in ADMIN_IDS:
+        bot.send_message(
+            message.chat.id,
+            "ℹ️ این کاربر از قبل ادمین است."
+        )
+    else:
+        add_extra_admin(target_id, added_by=admin_id)
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ کاربر <code>{target_id}</code> به‌عنوان ادمین اضافه شد."
+        )
+
+        try:
+            bot.send_message(
+                target_id,
+                "🎉 شما به‌عنوان ادمین ربات اضافه شدید. برای ورود به پنل مدیریت /admin را بفرستید."
+            )
+        except Exception:
+            pass
+
+    clear_admin_state(admin_id)
+
+    bot.send_message(
+        message.chat.id,
+        admin_admins_text(),
+        reply_markup=admin_admins_keyboard()
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN: PRICE EDITING (💲 تغییر قیمت سرویس‌ها)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -12011,11 +12857,9 @@ IRAN_UTC_OFFSET = timedelta(hours=3, minutes=30)
 
 
 def is_profit_admin(user_id):
-    return (
-        PROFIT_ADMIN_ID is not None
-        and user_id == PROFIT_ADMIN_ID
-        and user_id in ADMIN_IDS
-    )
+    # 💐 سود اخوان حالا برای همه‌ی ادمین‌های ربات در دسترس است،
+    # نه فقط «اخوان» (اولین ادمین در ADMIN_IDS).
+    return user_id in ADMIN_IDS
 
 
 def gregorian_to_jalali(gy, gm, gd):
@@ -12677,6 +13521,22 @@ def admin_state_message(message):
         handle_price_edit_message(
             message,
             state
+        )
+
+        return
+
+    if mode == "forcejoin_add":
+
+        handle_forcejoin_add_message(
+            message
+        )
+
+        return
+
+    if mode == "admin_add_wait_id":
+
+        handle_admin_add_message(
+            message
         )
 
         return
@@ -15296,6 +16156,8 @@ def main():
 
     init_db()
 
+    reload_admin_ids()
+
     applied_prices = load_price_overrides()
 
     logger.info(
@@ -15345,9 +16207,10 @@ def main():
         )
 
     logger.info(
-        "Bot started | admins=%s | channels=%s | products=%s",
+        "Bot started | admins=%s | force_join_channels=%s (enabled=%s) | products=%s",
         sorted(ADMIN_IDS),
-        CHANNEL_IDS,
+        [c["chat_id"] for c in get_force_join_channels()],
+        is_force_join_enabled(),
         len(PRODUCT_INDEX)
     )
 
