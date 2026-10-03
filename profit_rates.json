@@ -1,0 +1,10 @@
+{
+  "fixed": {
+    "wireguard-50gb-1m": 25000,
+    "wireguard-100gb-1m": 50000,
+    "wireguard-200gb-1m": 100000
+  },
+  "per_gb": {
+    "v2ray": 750
+  }
+}

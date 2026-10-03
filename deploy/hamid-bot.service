@@ -1,0 +1,16 @@
+[Unit]
+Description=Hamid Shop Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+WorkingDirectory=__DIR__
+# متغیرها از فایل .env داخل همین پوشه خوانده می‌شوند (python-dotenv)
+ExecStart=__DIR__/venv/bin/python -u bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
