@@ -438,14 +438,17 @@ TRIAL_IMPORTANT_NOTES = (
 )
 
 
-# متن راهنمای دریافت نام کاربری (هنگام خرید سرویس وایرساک / V2Ray)
-SERVICE_USERNAME_PROMPT = (
-    "👤 لطفاً یک نام کاربری برای همین سرویس ارسال کنید "
-    "تا همراه سفارش برای ادمین ارسال شود:\n\n"
-    "(اگر قبلاً پنل کاربری دریافت کرده بودید، شامل تست یا یک ماهه، "
-    "نام کاربری قبلی‌تان که داخل پنل برایتان نمایش داده می‌شد را "
-    "همینجا ارسال کنید تا روی همان اکانت قبلی برایتان تمدید شود)"
+# درخواست نام کاربری در خرید سرویس و دریافت تست، کوتاه و یکسان است.
+# فقط حروف لاتین، اعداد انگلیسی، خط تیره و زیرخط مجاز هستند.
+USERNAME_PROMPT = (
+    "👤 نام کاربری خود را به <b>انگلیسی</b> وارد کنید. فارسی تایپ نکنید!"
 )
+USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+USERNAME_INVALID_PROMPT = (
+    "❌ نام کاربری خود را هنوز وارد نکرده‌اید یا نام واردشده معتبر نیست.\n"
+    f"{USERNAME_PROMPT}"
+)
+SERVICE_USERNAME_PROMPT = USERNAME_PROMPT
 
 
 URL_RE = re.compile(
@@ -552,13 +555,21 @@ def init_db():
 
             CREATE TABLE IF NOT EXISTS wireguard_trials (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL UNIQUE,
+                user_id INTEGER NOT NULL,
                 username TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'pending',
                 panel_link TEXT,
                 delivered_at TEXT,
-                delivered_by INTEGER
+                delivered_by INTEGER,
+                api_created INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS wireguard_trial_quotas (
+                user_id INTEGER PRIMARY KEY,
+                allowed_count INTEGER NOT NULL DEFAULT 1 CHECK(allowed_count >= 0),
+                updated_by INTEGER,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS transactions (
@@ -877,6 +888,73 @@ def init_db():
                 ADD COLUMN delivered_by INTEGER
                 """
             )
+
+        if "api_created" not in trial_columns:
+            conn.execute(
+                """
+                ALTER TABLE wireguard_trials
+                ADD COLUMN api_created INTEGER NOT NULL DEFAULT 0
+                """
+            )
+
+        # Older databases enforced one row per user. Trial grants now have a
+        # history row per delivery, so remove that constraint without losing
+        # existing delivery records.
+        unique_user_constraint = False
+        for index in conn.execute(
+            "PRAGMA index_list(wireguard_trials)"
+        ).fetchall():
+            if not index["unique"]:
+                continue
+            index_columns = [
+                row["name"]
+                for row in conn.execute(
+                    f"PRAGMA index_info('{index['name']}')"
+                ).fetchall()
+            ]
+            if index_columns == ["user_id"]:
+                unique_user_constraint = True
+                break
+
+        if unique_user_constraint:
+            conn.execute(
+                "ALTER TABLE wireguard_trials RENAME TO wireguard_trials_legacy_unique"
+            )
+            conn.execute(
+                """
+                CREATE TABLE wireguard_trials (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    panel_link TEXT,
+                    delivered_at TEXT,
+                    delivered_by INTEGER,
+                    api_created INTEGER NOT NULL DEFAULT 0
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO wireguard_trials(
+                    id, user_id, username, created_at, status,
+                    panel_link, delivered_at, delivered_by, api_created
+                )
+                SELECT
+                    id, user_id, username, created_at, status,
+                    panel_link, delivered_at, delivered_by, api_created
+                FROM wireguard_trials_legacy_unique
+                """
+            )
+            conn.execute("DROP TABLE wireguard_trials_legacy_unique")
+
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_wireguard_trials_user
+            ON wireguard_trials(user_id, id)
+            """
+        )
 
         # Legacy database migration
         try:
@@ -1320,83 +1398,210 @@ def recent_transactions(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# WIREGUARD TRIAL
+# WIREGUARD TRIALS / PER-USER QUOTAS
 # ══════════════════════════════════════════════════════════════════════════════
 
-def has_wireguard_trial(user_id):
+def wireguard_trial_quota_status(user_id):
     with db() as conn:
-        row = conn.execute(
+        quota = conn.execute(
+            "SELECT allowed_count FROM wireguard_trial_quotas WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+        counts = conn.execute(
             """
-            SELECT id
+            SELECT
+                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+                SUM(CASE WHEN status IN ('pending', 'provisioning') THEN 1 ELSE 0 END) AS in_progress,
+                SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed
             FROM wireguard_trials
             WHERE user_id=?
             """,
             (user_id,)
         ).fetchone()
 
-    return row is not None
+    allowed = int(quota["allowed_count"]) if quota else 1
+    delivered = int(counts["delivered"] or 0) if counts else 0
+    in_progress = int(counts["in_progress"] or 0) if counts else 0
+    failed = int(counts["failed"] or 0) if counts else 0
+    return {
+        "allowed": allowed,
+        "delivered": delivered,
+        "in_progress": in_progress,
+        "failed": failed,
+        "remaining": max(0, allowed - delivered - in_progress),
+    }
 
 
-def create_wireguard_trial(
-    user_id,
-    username
-):
+def has_wireguard_trial(user_id):
+    """True when the user has no unused test grant left."""
+    return wireguard_trial_quota_status(user_id)["remaining"] <= 0
+
+
+def create_wireguard_trial(user_id, username):
+    """Reserve one allowed test grant and return its history row ID."""
     with db() as conn:
-        try:
-            conn.execute(
-                """
-                INSERT INTO wireguard_trials(
-                    user_id,
-                    username,
-                    created_at
-                )
-                VALUES (?, ?, ?)
-                """,
-                (
-                    user_id,
-                    username,
-                    now()
-                )
-            )
-        except sqlite3.IntegrityError:
-            return False
+        # Serialize quota checks so two rapid requests cannot exceed the limit.
+        conn.execute("BEGIN IMMEDIATE")
+        quota = conn.execute(
+            "SELECT allowed_count FROM wireguard_trial_quotas WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+        allowed = int(quota["allowed_count"]) if quota else 1
+        counts = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+                SUM(CASE WHEN status IN ('pending', 'provisioning') THEN 1 ELSE 0 END) AS in_progress
+            FROM wireguard_trials
+            WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()
+        delivered = int(counts["delivered"] or 0)
+        in_progress = int(counts["in_progress"] or 0)
 
-        return True
+        if delivered + in_progress >= allowed:
+            return None
+
+        cur = conn.execute(
+            """
+            INSERT INTO wireguard_trials(
+                user_id, username, created_at, status
+            )
+            VALUES (?, ?, ?, 'pending')
+            """,
+            (user_id, username, now())
+        )
+        return int(cur.lastrowid)
 
 
 def get_wireguard_trial(user_id):
+    """Return the latest trial row for a user (legacy callback compatibility)."""
     with db() as conn:
         return conn.execute(
             """
-            SELECT *
-            FROM wireguard_trials
+            SELECT * FROM wireguard_trials
             WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT 1
             """,
             (user_id,)
         ).fetchone()
 
 
-def mark_wireguard_trial_delivered(
-    user_id,
-    admin_id,
-    panel_link
-):
+def get_wireguard_trial_by_id(trial_id):
     with db() as conn:
+        return conn.execute(
+            "SELECT * FROM wireguard_trials WHERE id=?",
+            (trial_id,)
+        ).fetchone()
+
+
+def get_actionable_wireguard_trial(user_id, statuses=("pending", "provisioning", "failed")):
+    placeholders = ",".join("?" for _ in statuses)
+    with db() as conn:
+        return conn.execute(
+            f"""
+            SELECT * FROM wireguard_trials
+            WHERE user_id=? AND status IN ({placeholders})
+            ORDER BY CASE status
+                WHEN 'provisioning' THEN 0
+                WHEN 'pending' THEN 1
+                ELSE 2
+            END, id DESC
+            LIMIT 1
+            """,
+            (user_id, *statuses)
+        ).fetchone()
+
+
+def adjust_wireguard_trial_allowance(user_id, delta, admin_id):
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        quota = conn.execute(
+            "SELECT allowed_count FROM wireguard_trial_quotas WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+        current = int(quota["allowed_count"]) if quota else 1
+        counts = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+                SUM(CASE WHEN status IN ('pending', 'provisioning') THEN 1 ELSE 0 END) AS in_progress
+            FROM wireguard_trials WHERE user_id=?
+            """,
+            (user_id,)
+        ).fetchone()
+        delivered = int(counts["delivered"] or 0)
+        in_progress = int(counts["in_progress"] or 0)
+        base = max(current, delivered + in_progress) if int(delta) > 0 else current
+        updated = max(0, base + int(delta))
         conn.execute(
+            """
+            INSERT INTO wireguard_trial_quotas(
+                user_id, allowed_count, updated_by, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                allowed_count=excluded.allowed_count,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, updated, admin_id, now())
+        )
+    return updated
+
+
+def set_wireguard_trial_allowance(user_id, allowed_count, admin_id):
+    allowed_count = int(allowed_count)
+    if allowed_count < 0:
+        raise ValueError("Trial allowance cannot be negative")
+
+    with db() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            """
+            INSERT INTO wireguard_trial_quotas(
+                user_id, allowed_count, updated_by, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                allowed_count=excluded.allowed_count,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+            """,
+            (user_id, allowed_count, admin_id, now())
+        )
+    return allowed_count
+
+
+def mark_wireguard_trial_delivered(trial_id, admin_id, panel_link):
+    with db() as conn:
+        cur = conn.execute(
             """
             UPDATE wireguard_trials
             SET status='delivered',
                 panel_link=?,
                 delivered_at=?,
                 delivered_by=?
-            WHERE user_id=?
+            WHERE id=?
+            AND status IN ('pending', 'provisioning', 'failed')
             """,
-            (
-                panel_link,
-                now(),
-                admin_id,
-                user_id
-            )
+            (panel_link, now(), admin_id, trial_id)
+        )
+        return cur.rowcount == 1
+
+
+def mark_wireguard_trial_failed(trial_id):
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE wireguard_trials
+            SET status='failed'
+            WHERE id=?
+            AND status <> 'delivered'
+            """,
+            (trial_id,)
         )
 
 
@@ -1467,6 +1672,22 @@ def get_nav(user_id):
         "parent_state": row["parent_state"],
         "data": data
     }
+
+
+def username_input_is_pending(user_id):
+    return get_nav(user_id)["state"] in {
+        "awaiting_service_username",
+        "wireguard_trial_username",
+    }
+
+
+def remind_user_to_enter_username(chat_id):
+    bot.send_message(
+        chat_id,
+        "❌ نام کاربری خود را هنوز وارد نکرده‌اید.\n"
+        f"{USERNAME_PROMPT}",
+        reply_markup=remove_keyboard()
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3445,95 +3666,68 @@ def notify_fulfillment_admins(order_id):
             )
 
 
-def wireguard_trial_admin_text(
-    user_id,
-    username
-):
-    tg_line = ""
-
-    with db() as conn:
-
-        row = conn.execute(
-            """
-            SELECT username, first_name
-            FROM users
-            WHERE user_id=?
-            """,
-            (user_id,)
-        ).fetchone()
-
-    if row:
-
-        parts = []
-
-        if row["first_name"]:
-            parts.append(
-                esc(row["first_name"])
-            )
-
-        if row["username"]:
-            parts.append(
-                f"@{esc(row['username'])}"
-            )
-
-        if parts:
-            tg_line = (
-                "🆔 اکانت تلگرام: "
-                + " — ".join(parts)
-                + "\n"
-            )
-
+def wireguard_trial_admin_text(user_id, username, trial_id):
+    user = get_user_row(user_id)
+    account_lines = []
+    if user and user["first_name"]:
+        account_lines.append(esc(user["first_name"]))
+    if user and user["username"]:
+        account_lines.append(f"@{esc(user['username'])}")
+    tg_line = (
+        "🆔 اکانت تلگرام: " + " — ".join(account_lines) + "\n"
+        if account_lines else ""
+    )
+    quota = wireguard_trial_quota_status(user_id)
     return (
-        "🧪 <b>درخواست اکانت تست وایرساک</b>\n\n"
-        f"کاربر <b>{esc(username)}</b> درخواست اکانت تست و ارسال دارد.\n\n"
-        f"👤 نام کاربری تست: <b>{esc(username)}</b>\n"
+        "🧪 <b>اکانت تست به‌صورت خودکار تحویل شد</b>\n\n"
+        f"👤 نام کاربری سرویس: <b>{esc(username)}</b>\n"
         f"{tg_line}"
-        f"🔢 آیدی عددی: <code>{user_id}</code>\n\n"
-        "برای تحویل اکانت تست فقط دکمه زیر را بزنید؛ ربات خودش از EylanPanel اکانت را می‌سازد، لینک پنل را می‌گیرد و برای کاربر می‌فرستد.\n\n"
-        "ℹ️ در پیام آماده به کاربر یادآوری می‌شود که از اولین اتصال فقط "
-        "<b>۱ روز</b> فرصت تست دارد و اگر اصلاً وصل نشود، "
-        "اکانت حداکثر <b>۲ روز</b> فعال می‌ماند."
+        f"🔢 آیدی عددی: <code>{user_id}</code>\n"
+        f"🧾 شماره تحویل تست: <code>#{trial_id}</code>\n"
+        f"📊 سهمیه دریافت‌شده: <b>{quota['delivered']} از {quota['allowed']}</b>"
     )
 
 
-def wireguard_trial_admin_keyboard(user_id):
-    kb = types.InlineKeyboardMarkup(
-        row_width=1
-    )
-
+def wireguard_trial_retry_keyboard(trial_id):
+    kb = types.InlineKeyboardMarkup(row_width=1)
     kb.add(
         types.InlineKeyboardButton(
-            "📤 ارسال اکانت تست",
-            callback_data=f"wgtrial:send:{user_id}"
+            "🔄 تلاش مجدد برای تحویل خودکار",
+            callback_data=f"wgtrial:retry:{trial_id}"
         )
     )
-
     return kb
 
 
-def notify_admins_wireguard_trial(
-    user_id,
-    username
-):
-    text = wireguard_trial_admin_text(
-        user_id,
-        username
-    )
+def notify_admins_wireguard_trial(user_id, username, trial_id):
+    text = wireguard_trial_admin_text(user_id, username, trial_id)
+    for admin_id in ADMIN_IDS:
+        try:
+            bot.send_message(admin_id, text)
+        except Exception:
+            logger.exception(
+                "Failed notifying admin %s about delivered wireguard trial",
+                admin_id
+            )
 
-    kb = wireguard_trial_admin_keyboard(
-        user_id
-    )
 
+def notify_admins_wireguard_trial_failure(user_id, trial_id, error):
+    text = (
+        "❌ <b>تحویل خودکار اکانت تست ناموفق بود</b>\n\n"
+        f"کاربر: <code>{user_id}</code> — درخواست <code>#{trial_id}</code>\n"
+        f"جزئیات: <code>{esc(error)}</code>\n\n"
+        "این تلاش سهمیه کاربر را مصرف نمی‌کند. از دکمه زیر می‌توانید دوباره تلاش کنید."
+    )
     for admin_id in ADMIN_IDS:
         try:
             bot.send_message(
                 admin_id,
                 text,
-                reply_markup=kb
+                reply_markup=wireguard_trial_retry_keyboard(trial_id)
             )
         except Exception:
             logger.exception(
-                "Failed notifying admin %s about wireguard trial",
+                "Failed notifying admin %s about failed wireguard trial",
                 admin_id
             )
 
@@ -3697,7 +3891,7 @@ def wireguard_trial_delivery_template(
         "🎉 <b>اکانت تست شما با موفقیت آماده شد!</b>\n\n"
         "🙏 از اینکه این ربات را برای دریافت سرویس خود انتخاب کردید، صمیمانه سپاسگزاریم.\n"
         "💙 اعتماد شما برای ما ارزشمند است و خوشحالیم که در خدمت شما هستیم.\n\n"
-        "✅ <b>درخواست اکانت تست شما تأیید شد.</b>\n\n"
+        "✅ <b>اکانت تست شما به‌صورت خودکار آماده شد.</b>\n\n"
         f"{username_line}"
         "🧪 <b>اکانت تست وایرساک / وایرگارد شما:</b>\n\n"
         f"{link_box}\n\n"
@@ -4054,9 +4248,7 @@ def complete_order(order_id):
 # FULFILLMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-EYLAN_USERNAME_RE = re.compile(
-    r"^[A-Za-z0-9_-]{1,80}$"
-)
+EYLAN_USERNAME_RE = USERNAME_RE
 
 
 def eylan_plan_for_product(product_id):
@@ -4249,39 +4441,34 @@ def eylan_payload_for_product(
 
 def local_username_belongs_to_user(
     user_id,
-    username
+    username,
+    *,
+    exclude_order_id=None,
+    exclude_trial_id=None,
 ):
     username = (username or "").strip()
     if not username:
         return False
 
     with db() as conn:
-        order_rows = conn.execute(
-            """
-            SELECT user_id
-            FROM orders
-            WHERE service_username=?
-            """,
-            (username,)
-        ).fetchall()
+        order_sql = "SELECT user_id FROM orders WHERE service_username=?"
+        order_params = [username]
+        if exclude_order_id is not None:
+            order_sql += " AND id<>?"
+            order_params.append(exclude_order_id)
+        order_rows = conn.execute(order_sql, tuple(order_params)).fetchall()
 
         service_rows = conn.execute(
-            """
-            SELECT user_id
-            FROM active_services
-            WHERE service_username=?
-            """,
+            "SELECT user_id FROM active_services WHERE service_username=?",
             (username,)
         ).fetchall()
 
-        trial_rows = conn.execute(
-            """
-            SELECT user_id
-            FROM wireguard_trials
-            WHERE username=?
-            """,
-            (username,)
-        ).fetchall()
+        trial_sql = "SELECT user_id FROM wireguard_trials WHERE username=?"
+        trial_params = [username]
+        if exclude_trial_id is not None:
+            trial_sql += " AND id<>?"
+            trial_params.append(exclude_trial_id)
+        trial_rows = conn.execute(trial_sql, tuple(trial_params)).fetchall()
 
     owners = {
         int(row["user_id"])
@@ -4472,7 +4659,11 @@ def provision_eylan_order_with_api(order):
     # For existing users, validate local ownership before touching the remote account.
     existing_remote = client.get_user(username)
     if existing_remote is not None:
-        if not local_username_belongs_to_user(order["user_id"], username):
+        if not local_username_belongs_to_user(
+            order["user_id"],
+            username,
+            exclude_order_id=order["id"],
+        ):
             raise EylanPanelError(
                 f"نام کاربری {username} از قبل در EylanPanel وجود دارد، اما در دیتابیس این ربات برای این کاربر ثبت نشده است؛ "
                 "برای جلوگیری از دستکاری اکانت شخص دیگر، سفارش متوقف شد."
@@ -4529,80 +4720,77 @@ def provision_v2ray_order_with_api(order):
     return provision_eylan_order_with_api(order)
 
 
-def _save_trial_panel_link(
-    user_id,
-    panel_link
-):
+def _save_trial_panel_link(trial_id, panel_link):
     with db() as conn:
         conn.execute(
-            """
-            UPDATE wireguard_trials
-            SET panel_link=?
-            WHERE user_id=?
-            """,
-            (
-                panel_link,
-                user_id
-            )
+            "UPDATE wireguard_trials SET panel_link=? WHERE id=?",
+            (panel_link, trial_id)
         )
 
 
-def provision_wireguard_trial_with_api(
-    trial
-):
+def _mark_trial_api_created(trial_id):
+    with db() as conn:
+        conn.execute(
+            "UPDATE wireguard_trials SET api_created=1 WHERE id=?",
+            (trial_id,)
+        )
+
+
+def provision_wireguard_trial_with_api(trial):
     username = (trial["username"] or "").strip()
 
-    if not username:
+    if not USERNAME_RE.fullmatch(username):
         raise EylanPanelError(
-            "نام کاربری اکانت تست خالی است."
+            "نام کاربری اکانت تست باید فقط شامل حروف انگلیسی، عدد، _ یا - باشد."
         )
 
     if trial["panel_link"]:
         return username, trial["panel_link"]
 
+    trial_id = int(trial["id"])
     client = get_eylan_client()
     payload = eylan_payload_for_product(
         TRIAL_PRODUCT_ID,
         username,
-        for_update=False
+        for_update=False,
+        client=client,
     )
 
     existing_remote = client.get_user(username)
 
     if existing_remote is not None:
-        # این username قبلاً توسط همین درخواست تست این ربات ثبت شده است؛
-        # فقط لینک را دوباره از API می‌گیریم تا کاربر تکراری ساخته نشود.
-        local_username_belongs_to_user(
+        # اکانتی که همین درخواست ساخته را می‌توان امن Retry کرد؛ در غیر این
+        # صورت وجود سابقهٔ مالکیت محلی لازم است تا حساب کاربر دیگری دست‌کاری نشود.
+        created_by_this_trial = bool(trial["api_created"])
+        belongs_to_user = local_username_belongs_to_user(
             trial["user_id"],
-            username
+            username,
+            exclude_trial_id=trial_id,
         )
+        if not created_by_this_trial and not belongs_to_user:
+            raise EylanPanelError(
+                f"نام کاربری {username} از قبل در پنل وجود دارد، اما به این کاربر تعلق ندارد."
+            )
+        update_payload = eylan_payload_for_product(
+            TRIAL_PRODUCT_ID,
+            username,
+            for_update=True,
+            client=client,
+        )
+        client.update_user(username, update_payload)
         final_username = username
     else:
-        final_username = client.create_user(
-            payload
-        )
+        final_username = client.create_user(payload)
+        _mark_trial_api_created(trial_id)
 
-    link = client.get_subscription_link(
-        final_username
-    )
-
-    _save_trial_panel_link(
-        trial["user_id"],
-        link
-    )
+    link = client.get_subscription_link(final_username)
+    _save_trial_panel_link(trial_id, link)
 
     if final_username != username:
         with db() as conn:
             conn.execute(
-                """
-                UPDATE wireguard_trials
-                SET username=?
-                WHERE user_id=?
-                """,
-                (
-                    final_username,
-                    trial["user_id"]
-                )
+                "UPDATE wireguard_trials SET username=? WHERE id=?",
+                (final_username, trial_id)
             )
 
     return final_username, link
@@ -4722,28 +4910,56 @@ def deliver_v2ray_order_via_api(admin_id, order_id):
 
 
 def deliver_wireguard_trial_via_api(
-    admin_id,
-    target_id
+    target_id,
+    trial_id,
+    requested_by_admin=None,
 ):
-    trial = get_wireguard_trial(target_id)
+    trial = get_wireguard_trial_by_id(trial_id)
+    if not trial or int(trial["user_id"]) != int(target_id):
+        if requested_by_admin:
+            bot.send_message(requested_by_admin, "درخواست تست پیدا نشد.")
+        return False
 
-    if not trial:
-        clear_admin_state(admin_id)
-        bot.send_message(
-            admin_id,
-            "درخواست تست پیدا نشد."
-        )
+    if trial["status"] == "delivered":
+        if requested_by_admin:
+            bot.send_message(requested_by_admin, "این اکانت تست قبلاً تحویل شده است.")
         return True
 
-    try:
-        final_username, panel_link = provision_wireguard_trial_with_api(
-            trial
+    if (
+        trial["status"] == "failed"
+        and wireguard_trial_quota_status(target_id)["remaining"] <= 0
+    ):
+        if requested_by_admin:
+            bot.send_message(
+                requested_by_admin,
+                "سهمیه آزاد برای این کاربر باقی نمانده است؛ ابتدا سهمیه او را در پنل افزایش دهید."
+            )
+        return False
+
+    with db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE wireguard_trials
+            SET status='provisioning'
+            WHERE id=? AND status IN ('pending', 'failed')
+            """,
+            (trial_id,)
         )
 
-        delivery_msg = wireguard_trial_delivery_template(
-            panel_link,
-            final_username
-        )
+    if cur.rowcount != 1:
+        if requested_by_admin:
+            bot.send_message(
+                requested_by_admin,
+                "این درخواست تست در حال آماده‌سازی است یا دیگر قابل تحویل نیست."
+            )
+        return False
+
+    try:
+        # تازه‌ترین ردیف را بخوانید تا وضعیت رزرو‌شده و لینک ذخیره‌شدهٔ Retry
+        # در همین تلاش استفاده شود.
+        trial = get_wireguard_trial_by_id(trial_id)
+        final_username, panel_link = provision_wireguard_trial_with_api(trial)
+        delivery_msg = wireguard_trial_delivery_template(panel_link, final_username)
 
         bot.send_message(
             target_id,
@@ -4752,30 +4968,28 @@ def deliver_wireguard_trial_via_api(
         )
 
         mark_wireguard_trial_delivered(
-            target_id,
-            admin_id,
+            trial_id,
+            requested_by_admin,
             panel_link
         )
 
+        # هر تحویل تست سرویس مستقل خودش را دارد؛ Retry همان ردیف را دوباره
+        # ثبت نمی‌کند و تست‌های اضافه نیز در فهرست سرویس‌ها گم نمی‌شوند.
         try:
             with db() as conn:
                 already = conn.execute(
                     """
-                    SELECT id
-                    FROM active_services
-                    WHERE user_id=?
-                    AND service_type=?
+                    SELECT id FROM active_services
+                    WHERE user_id=? AND order_id=? AND service_type=?
+                    LIMIT 1
                     """,
-                    (
-                        target_id,
-                        TRIAL_SERVICE_TYPE
-                    )
+                    (target_id, trial_id, TRIAL_SERVICE_TYPE)
                 ).fetchone()
 
             if not already:
                 create_active_service(
                     user_id=target_id,
-                    order_id=0,
+                    order_id=trial_id,
                     service_type=TRIAL_SERVICE_TYPE,
                     product_id=TRIAL_PRODUCT_ID,
                     product_title=TRIAL_PRODUCT_TITLE,
@@ -4785,64 +4999,41 @@ def deliver_wireguard_trial_via_api(
                 )
         except Exception:
             logger.exception(
-                "Failed registering trial service for user %s",
+                "Failed registering trial service %s for user %s",
+                trial_id,
                 target_id
             )
-            # تحویل انجام شده؛ خطای ثبت داخلی نباید باعث ساخت اکانت دوم شود.
 
-        clear_admin_state(
-            admin_id
-        )
-
-        bot.send_message(
-            admin_id,
-            f"✅ اکانت تست برای کاربر <code>{target_id}</code> "
-            f"(<b>{esc(final_username)}</b>) به‌صورت خودکار ساخته و ارسال شد."
-        )
-
-    except EylanPanelError as exc:
-        logger.exception(
-            "EylanPanel trial fulfillment failed for user %s",
-            target_id
-        )
-
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            types.InlineKeyboardButton(
-                "🔄 تلاش مجدد",
-                callback_data=f"wgtrial:send:{target_id}"
-            )
-        )
-
-        bot.send_message(
-            admin_id,
-            "❌ ساخت خودکار اکانت تست انجام نشد.\n\n"
-            f"<code>{esc(str(exc))}</code>",
-            reply_markup=kb
-        )
+        notify_admins_wireguard_trial(target_id, final_username, trial_id)
+        return True
 
     except Exception as exc:
+        mark_wireguard_trial_failed(trial_id)
         logger.exception(
-            "Unexpected EylanPanel trial failure for user %s",
-            target_id
+            "Automatic wireguard trial delivery failed for user %s (trial %s)",
+            target_id,
+            trial_id
         )
 
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        kb.add(
-            types.InlineKeyboardButton(
-                "🔄 تلاش مجدد",
-                callback_data=f"wgtrial:send:{target_id}"
+        # جزئیات فنی فقط برای ادمین‌ها ارسال می‌شود؛ کاربر نام داخلی پنل/API
+        # یا خطای پیکربندی را نمی‌بیند.
+        notify_admins_wireguard_trial_failure(target_id, trial_id, str(exc))
+        try:
+            bot.send_message(
+                target_id,
+                "❌ آماده‌سازی خودکار اکانت تست موقتاً انجام نشد. "
+                "سهمیه شما مصرف نشده است؛ لطفاً کمی بعد دوباره از بخش تست اقدام کنید "
+                "یا با پشتیبانی تماس بگیرید.",
+                reply_markup=reply_main_keyboard()
             )
-        )
-
-        bot.send_message(
-            admin_id,
-            "❌ خطای غیرمنتظره در تحویل اکانت تست.\n\n"
-            f"<code>{esc(str(exc))}</code>",
-            reply_markup=kb
-        )
-
-    return True
+        except Exception:
+            logger.exception(
+                "Could not notify user %s about a failed trial delivery",
+                target_id
+            )
+            if "blocked" in str(exc).lower() or "chat not found" in str(exc).lower():
+                set_blocked(target_id, True)
+        return False
 
 
 def deliver_order_payload(
@@ -5229,175 +5420,15 @@ def deliver_order_payload(
     return True
 
 
-def deliver_wireguard_trial_payload(
-    admin_id,
-    message
-):
-    state = get_admin_state(
-        admin_id
-    )
-
+def deliver_wireguard_trial_payload(admin_id, message):
+    """Legacy admin input path is intentionally disabled: trials are automatic."""
+    state = get_admin_state(admin_id)
     if not state or state["mode"] != "wg_trial_send":
         return False
-
-    if message.content_type != "text":
-
-        bot.send_message(
-            admin_id,
-            "❌ لطفاً فقط لینک پنل کاربری را به صورت متن ارسال کنید.\n"
-            "برای لغو، /cancel را بفرستید."
-        )
-
-        return True
-
-    target_id = int(
-        state["data"].get(
-            "user_id",
-            0
-        )
-    )
-
-    username = state["data"].get(
-        "username",
-        ""
-    )
-
-    payload = (
-        message.text or ""
-    ).strip()
-
-    if not payload:
-
-        bot.send_message(
-            admin_id,
-            "❌ لینک خالی است. دوباره ارسال کنید."
-        )
-
-        return True
-
-    if not is_url_text(payload):
-
-        bot.send_message(
-            admin_id,
-            "❌ چیزی که فرستادید لینک معتبر نیست.\n"
-            "لطفاً فقط لینک پنل کاربری را (بدون متن اضافه) ارسال کنید.\n"
-            "برای لغو، /cancel را بفرستید."
-        )
-
-        return True
-
-    delivery_msg = wireguard_trial_delivery_template(
-        payload,
-        username
-    )
-
-    try:
-
-        bot.send_message(
-            target_id,
-            delivery_msg,
-            reply_markup=reply_main_keyboard()
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Failed delivering wireguard trial to user %s",
-            target_id
-        )
-
-        if (
-            "blocked" in str(exc).lower()
-            or "chat not found" in str(exc).lower()
-        ):
-
-            set_blocked(
-                target_id,
-                True
-            )
-
-        bot.send_message(
-            admin_id,
-            "❌ ارسال اکانت تست انجام نشد. کاربر ربات را بلاک کرده یا در دسترس نیست."
-        )
-
-        return True
-
-    mark_wireguard_trial_delivered(
-        target_id,
-        admin_id,
-        payload
-    )
-
-    # اکانت تست حداکثر TRIAL_ACTIVE_DAYS روز فعال می‌ماند.
-    try:
-
-        with db() as conn:
-
-            already = conn.execute(
-                """
-                SELECT id
-                FROM active_services
-                WHERE user_id=?
-                AND service_type=?
-                """,
-                (
-                    target_id,
-                    TRIAL_SERVICE_TYPE
-                )
-            ).fetchone()
-
-        if not already:
-
-            create_active_service(
-                user_id=target_id,
-                order_id=0,
-                service_type=TRIAL_SERVICE_TYPE,
-                product_id=TRIAL_PRODUCT_ID,
-                product_title=TRIAL_PRODUCT_TITLE,
-                has_expiry=True,
-                expiry_days=TRIAL_ACTIVE_DAYS,
-                service_username=username
-            )
-
-    except Exception:
-
-        logger.exception(
-            "Failed registering trial service for user %s",
-            target_id
-        )
-
-    clear_admin_state(
-        admin_id
-    )
-
-    notify_chat_id = state["data"].get(
-        "notify_chat_id"
-    )
-
-    notify_message_id = state["data"].get(
-        "notify_message_id"
-    )
-
-    if notify_chat_id and notify_message_id:
-
-        try:
-
-            bot.edit_message_reply_markup(
-                notify_chat_id,
-                notify_message_id,
-                reply_markup=None
-            )
-
-        except Exception:
-            pass
-
     bot.send_message(
         admin_id,
-        f"✅ اکانت تست برای کاربر <code>{target_id}</code> "
-        f"(<b>{esc(username)}</b>) در قالب پیام آماده ارسال شد."
+        "تحویل اکانت تست فقط به‌صورت خودکار انجام می‌شود؛ لینک دستی دریافت نمی‌شود."
     )
-
     return True
 
 
@@ -5922,7 +5953,7 @@ def admin_stats_keyboard():
 # ADMIN PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
-def admin_panel_keyboard(admin_id=None):
+def admin_panel_keyboard(admin_id=None, chat_id=None):
     kb = types.InlineKeyboardMarkup(
         row_width=2
     )
@@ -6006,8 +6037,24 @@ def admin_panel_keyboard(admin_id=None):
         )
     )
 
-    # 💐 سود اخوان حالا برای همه‌ی ادمین‌ها نمایش داده می‌شود.
-    if admin_id is not None and admin_id in ADMIN_IDS:
+    if (
+        admin_id is not None
+        and admin_id in ADMIN_IDS
+        and chat_id is not None
+        and int(chat_id) == int(admin_id)
+    ):
+        kb.row(
+            types.InlineKeyboardButton(
+                "🛠 مدیریت EylanPanel",
+                callback_data="admin:eylan"
+            ),
+            types.InlineKeyboardButton(
+                "🧪 مدیریت سهمیه تست",
+                callback_data="admin:trial_quota"
+            )
+        )
+
+        # سود اخوان برای همه‌ی ادمین‌های مجاز نمایش داده می‌شود.
         kb.row(
             types.InlineKeyboardButton(
                 "💐 سود اخوان",
@@ -6016,6 +6063,202 @@ def admin_panel_keyboard(admin_id=None):
         )
 
     return kb
+
+
+def admin_trial_quota_keyboard(user_id):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton(
+            "➕ افزایش یک تست",
+            callback_data=f"trialquota:adjust:{user_id}:1"
+        ),
+        types.InlineKeyboardButton(
+            "➖ کاهش یک تست",
+            callback_data=f"trialquota:adjust:{user_id}:-1"
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            "✏️ تنظیم تعداد مجاز",
+            callback_data=f"trialquota:set:{user_id}"
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔄 بروزرسانی اطلاعات",
+            callback_data=f"trialquota:refresh:{user_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+    return kb
+
+
+def admin_trial_quota_text(user_id):
+    user = get_user_row(user_id)
+    if not user:
+        return None
+
+    quota = wireguard_trial_quota_status(user_id)
+    identity = esc(user["first_name"] or "بدون نام")
+    if user["username"]:
+        identity += f" — @{esc(user['username'])}"
+
+    with db() as conn:
+        recent = conn.execute(
+            """
+            SELECT id, username, status, created_at
+            FROM wireguard_trials
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT 5
+            """,
+            (user_id,)
+        ).fetchall()
+
+    lines = [
+        "🧪 <b>مدیریت سهمیه اکانت تست</b>",
+        f"👤 کاربر: {identity}",
+        f"🔢 آیدی عددی: <code>{user_id}</code>",
+        "",
+        f"🎟 تعداد مجاز: <b>{quota['allowed']}</b>",
+        f"✅ تحویل‌شده: <b>{quota['delivered']}</b>",
+        f"⏳ در حال آماده‌سازی: <b>{quota['in_progress']}</b>",
+        f"🟢 قابل دریافت: <b>{quota['remaining']}</b>",
+        f"⚠️ تلاش ناموفق (سهمیه مصرف نشده): <b>{quota['failed']}</b>",
+    ]
+    if recent:
+        lines.extend(["", "📋 <b>آخرین درخواست‌ها</b>"])
+        status_labels = {
+            "pending": "در صف آماده‌سازی",
+            "provisioning": "در حال آماده‌سازی",
+            "delivered": "تحویل شده",
+            "failed": "ناموفق — قابل تلاش مجدد",
+        }
+        for row in recent:
+            created = (row["created_at"] or "")[:16].replace("T", " ")
+            lines.append(
+                f"• <code>#{row['id']}</code> — <b>{esc(row['username'])}</b> — "
+                f"{status_labels.get(row['status'], esc(row['status']))} — {esc(created)}"
+            )
+    return "\n".join(lines)
+
+
+def show_admin_trial_quota(chat_id, user_id):
+    text = admin_trial_quota_text(user_id)
+    if text is None:
+        bot.send_message(
+            chat_id,
+            "⚠️ کاربری با این آیدی در دیتابیس ربات پیدا نشد. آیدی را دوباره وارد کنید."
+        )
+        return False
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=admin_trial_quota_keyboard(user_id)
+    )
+    return True
+
+
+def eylan_admin_dashboard_text():
+    with db() as conn:
+        local_accounts = conn.execute(
+            """
+            SELECT COUNT(*) FROM active_services
+            WHERE service_type IN ('wireguard', 'v2ray', 'wireguard_trial')
+            """
+        ).fetchone()[0]
+
+    lines = [
+        "🛠 <b>مدیریت EylanPanel</b>",
+        f"📦 سرویس‌های ثبت‌شده در ربات: <b>{int(local_accounts):,}</b>",
+    ]
+    if not EYLAN_API_KEY:
+        lines.append("🔌 وضعیت ارتباط: <b>کلید API تنظیم نشده است</b>")
+        return "\n".join(lines)
+
+    try:
+        client = get_eylan_client()
+        panel_status = client.status()
+        users = client.list_users()
+        nodes = client.get_nodes()
+        inbounds = client.get_singbox_inbounds()
+        state = (
+            panel_status.get("status")
+            or panel_status.get("message")
+            or "پاسخ سالم دریافت شد"
+        )
+        lines.extend([
+            "🔌 وضعیت ارتباط: <b>متصل ✅</b>",
+            f"🟢 پاسخ پنل: <code>{esc(state)}</code>",
+            f"👥 تعداد حساب‌های پنل: <b>{len(users):,}</b>",
+            f"🌐 Nodeهای در دسترس: <b>{len(nodes):,}</b>",
+            f"🛜 Inboundهای قابل استفاده: <b>{len(inbounds):,}</b>",
+        ])
+    except Exception as exc:
+        logger.exception("Failed loading admin EylanPanel dashboard")
+        lines.extend([
+            "🔌 وضعیت ارتباط: <b>خطا در دریافت اطلاعات</b>",
+            f"<code>{esc(str(exc))}</code>",
+        ])
+    return "\n".join(lines)
+
+
+def eylan_admin_dashboard_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔄 بروزرسانی وضعیت پنل",
+            callback_data="admin:eylan"
+        ),
+        types.InlineKeyboardButton(
+            "📋 سرویس‌های ثبت‌شده در ربات",
+            callback_data="admin:eylan:local"
+        ),
+        types.InlineKeyboardButton(
+            "🧪 مدیریت سهمیه تست",
+            callback_data="admin:trial_quota"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل مدیریت",
+            callback_data="admin:home"
+        )
+    )
+    return kb
+
+
+def eylan_local_services_text():
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.*, u.username AS telegram_username
+            FROM active_services s
+            LEFT JOIN users u ON u.user_id=s.user_id
+            WHERE s.service_type IN ('wireguard', 'v2ray', 'wireguard_trial')
+            ORDER BY s.id DESC
+            LIMIT 25
+            """
+        ).fetchall()
+
+    if not rows:
+        return "📋 <b>سرویس‌های ثبت‌شده</b>\n\nسرویسی در دیتابیس ثبت نشده است."
+
+    lines = ["📋 <b>آخرین سرویس‌های ثبت‌شده در ربات</b>", ""]
+    for row in rows:
+        label = service_type_label(row)
+        telegram_name = f"@{row['telegram_username']}" if row["telegram_username"] else "—"
+        username = row["service_username"] or "ثبت‌نشده"
+        expires = (row["expires_at"] or "بدون تاریخ انقضا")[:16].replace("T", " ")
+        lines.append(
+            f"<b>#{row['id']} {esc(label)}</b> — کاربر <code>{row['user_id']}</code> ({esc(telegram_name)})\n"
+            f"نام کاربری سرویس: <code>{esc(username)}</code>\n"
+            f"محصول: {esc(row['product_title'])}\n"
+            f"شروع: {esc((row['started_at'] or '')[:16].replace('T', ' '))} — انقضا: {esc(expires)}"
+        )
+        lines.append("")
+    return "\n".join(lines).strip()
 
 
 def admin_guide_keyboard():
@@ -7120,8 +7363,8 @@ def show_server_status_menu(chat_id, user_id):
             logger.exception("Failed to fetch server status for service %s", services[0]["id"])
             bot.send_message(
                 chat_id,
-                "⚠️ در حال حاضر دریافت وضعیت لحظه‌ای سرور از پنل ممکن نشد.\n\n"
-                f"<code>{esc(str(exc))}</code>\n\n"
+                "⚠️ در حال حاضر دریافت وضعیت لحظه‌ای سرور ممکن نشد. "
+                "لطفاً کمی بعد دوباره تلاش کنید.\n\n"
                 + format_service_card(services[0]),
                 reply_markup=service_detail_keyboard(services[0])
             )
@@ -7503,6 +7746,10 @@ def start(message):
         message.from_user
     )
 
+    if username_input_is_pending(message.from_user.id):
+        remind_user_to_enter_username(message.chat.id)
+        return
+
     if not ensure_joined(message):
         return
 
@@ -7519,6 +7766,12 @@ def start(message):
 def admin_command(message):
     if message.from_user.id not in ADMIN_IDS:
         return
+    if getattr(message.chat, "type", None) != "private":
+        bot.send_message(
+            message.chat.id,
+            "برای حفظ امنیت، پنل مدیریت را فقط در گفت‌وگوی خصوصی ربات باز کنید."
+        )
+        return
 
     clear_admin_state(
         message.from_user.id
@@ -7528,7 +7781,7 @@ def admin_command(message):
         message.chat.id,
         "🛠 <b>پنل مدیریت</b>\n\n"
         "بخش موردنظر را انتخاب کنید:",
-        reply_markup=admin_panel_keyboard(message.from_user.id)
+        reply_markup=admin_panel_keyboard(message.from_user.id, message.chat.id)
     )
 
 
@@ -7567,6 +7820,10 @@ def balance_command(message):
         message.from_user
     )
 
+    if username_input_is_pending(message.from_user.id):
+        remind_user_to_enter_username(message.chat.id)
+        return
+
     if not ensure_joined(message):
         return
 
@@ -7592,6 +7849,24 @@ def orders_command(message):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# USERNAME INPUT GUARD
+# ══════════════════════════════════════════════════════════════════════════════
+
+@bot.callback_query_handler(
+    func=lambda c: username_input_is_pending(c.from_user.id)
+    and c.data != "check_join"
+)
+def cb_block_navigation_while_username_missing(call):
+    bot.answer_callback_query(
+        call.id,
+        "ابتدا نام کاربری انگلیسی را وارد کنید.",
+        show_alert=True
+    )
+    chat_id = call.message.chat.id if call.message else call.from_user.id
+    remind_user_to_enter_username(chat_id)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # JOIN CALLBACK
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -7607,6 +7882,19 @@ def cb_check_join(call):
             call.id,
             "عضویت شما تأیید شد ✅"
         )
+
+        if username_input_is_pending(call.from_user.id):
+            try:
+                bot.delete_message(
+                    call.message.chat.id,
+                    call.message.message_id
+                )
+            except Exception:
+                pass
+            remind_user_to_enter_username(
+                call.message.chat.id if call.message else call.from_user.id
+            )
+            return
 
         try:
             bot.delete_message(
@@ -7629,6 +7917,10 @@ def cb_check_join(call):
             "هنوز عضویت شما در همه کانال‌ها تأیید نشده است.",
             show_alert=True
         )
+        if username_input_is_pending(call.from_user.id):
+            remind_user_to_enter_username(
+                call.message.chat.id if call.message else call.from_user.id
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -7736,42 +8028,58 @@ def cb_v2ray(call):
 )
 def cb_wg_trial_start(call):
     if not is_member(call.from_user.id):
-
         bot.answer_callback_query(
             call.id,
             "ابتدا عضویت خود را تکمیل کنید.",
             show_alert=True
         )
-
         return
 
-    if has_wireguard_trial(call.from_user.id):
+    user_id = call.from_user.id
+    existing = get_actionable_wireguard_trial(
+        user_id,
+        statuses=("pending", "provisioning")
+    )
+    if existing:
+        if existing["status"] == "provisioning":
+            bot.answer_callback_query(
+                call.id,
+                "اکانت تست شما در حال آماده‌سازی است؛ لطفاً کمی صبر کنید.",
+                show_alert=True
+            )
+            return
 
+        # درخواست‌های منتظر از نسخه قبلی، بدون گرفتن تأیید ادمین خودکار ادامه داده می‌شوند.
+        save_nav(user_id, "home", None, {})
+        bot.answer_callback_query(call.id, "در حال آماده‌سازی خودکار اکانت تست...")
+        bot.send_message(
+            call.message.chat.id,
+            "⏳ درخواست تست شما در حال آماده‌سازی است. لطفاً کمی صبر کنید.",
+            reply_markup=remove_keyboard()
+        )
+        deliver_wireguard_trial_via_api(user_id, existing["id"])
+        return
+
+    quota = wireguard_trial_quota_status(user_id)
+    if quota["remaining"] <= 0:
         bot.answer_callback_query(
             call.id,
-            "❌ شما قبلاً از اکانت تست وایرساک استفاده کرده‌اید. "
-            "هر اکانت تلگرام فقط یک‌بار می‌تواند اکانت تست دریافت کند.",
+            "❌ سهمیه تست شما تمام شده است. برای دریافت تست اضافه با پشتیبانی تماس بگیرید.",
             show_alert=True
         )
-
         return
 
-    bot.answer_callback_query(
-        call.id
-    )
-
+    bot.answer_callback_query(call.id)
     save_nav(
-        call.from_user.id,
+        user_id,
         "wireguard_trial_username",
         "wireguard",
         {}
     )
-
     bot.send_message(
         call.message.chat.id,
-        "🧪 <b>اکانت تست وایرساک</b>\n\n"
-        "لطفاً یک نام کاربری برای اکانت تست ارسال کنید:",
-        reply_markup=reply_back_keyboard()
+        USERNAME_PROMPT,
+        reply_markup=remove_keyboard()
     )
 
 
@@ -8527,8 +8835,7 @@ def cb_server_status(call):
         logger.exception("Failed to fetch server status for service %s", service_id)
         bot.send_message(
             call.message.chat.id,
-            "⚠️ دریافت وضعیت لحظه‌ای از EylanPanel انجام نشد.\n\n"
-            f"<code>{esc(str(exc))}</code>\n\n"
+            "⚠️ دریافت وضعیت لحظه‌ای سرور انجام نشد. لطفاً کمی بعد دوباره تلاش کنید.\n\n"
             + format_service_card(svc),
             reply_markup=service_detail_keyboard(svc)
         )
@@ -9951,16 +10258,15 @@ def cb_fulfill_start(call):
             )
             return
 
-    # V2Ray فقط به‌صورت دستی تحویل داده می‌شود؛ انتخاب روش تحویل نمایش داده نمی‌شود.
-    if service_for_product(order["product_id"]) == "v2ray":
+    # فقط سرویس‌های گیمینگ WireGuard امکان تحویل خودکار دارند.
+    # V2Ray و تمام محصولات هوش مصنوعی مستقیماً وارد مسیر دستی می‌شوند.
+    service = service_for_product(order["product_id"])
+    if service != "wireguard":
         bot.answer_callback_query(
             call.id,
-            "تحویل V2Ray دستی است ✋"
+            "این محصول فقط به‌صورت دستی تحویل می‌شود ✋"
         )
-        _start_manual_fulfillment(
-            call.from_user.id,
-            order_id
-        )
+        _start_manual_fulfillment(call.from_user.id, order_id)
         return
 
     set_admin_state(
@@ -9987,17 +10293,10 @@ def cb_fulfill_start(call):
         )
     )
 
-    service = service_for_product(order["product_id"])
-    if service == "wireguard":
-        auto_note = (
-            "✅ برای این محصول، تحویل اتوماتیک از EylanPanel در دسترس است.\n"
-            "در حالت دستی، ربات همان لینک/فایل ارسالی شما را داخل پیام آماده قرار می‌دهد."
-        )
-    else:
-        auto_note = (
-            "ℹ️ تحویل اتوماتیک فقط برای سرویس WireGuard فعال است.\n"
-            "برای سایر محصولات، گزینه «تحویل دستی» را انتخاب کنید."
-        )
+    auto_note = (
+        "✅ این سرویس گیمینگ امکان تحویل خودکار را دارد.\n"
+        "در حالت دستی، لینک/فایل را خودتان ارسال می‌کنید."
+    )
 
     bot.send_message(
         call.from_user.id,
@@ -10285,29 +10584,53 @@ def cb_wg_trial_send(call):
         )
         return
 
-    set_admin_state(
-        call.from_user.id,
-        "wg_trial_send",
-        {
-            "user_id": target_id,
-            "notify_chat_id": call.message.chat.id,
-            "notify_message_id": call.message.message_id
-        }
-    )
+    if trial["status"] == "delivered":
+        bot.answer_callback_query(call.id, "این تست قبلاً به کاربر تحویل شده است.", show_alert=True)
+        return
 
-    bot.answer_callback_query(
-        call.id,
-        "در حال ساخت و ارسال خودکار..."
-    )
-
+    bot.answer_callback_query(call.id, "در حال تلاش برای تحویل خودکار...")
     bot.send_message(
         call.from_user.id,
-        "⚙️ در حال ساخت اکانت تست در EylanPanel و دریافت لینک پنل..."
+        "⏳ در حال آماده‌سازی خودکار اکانت تست برای کاربر هستیم."
+    )
+    deliver_wireguard_trial_via_api(
+        target_id,
+        trial["id"],
+        requested_by_admin=call.from_user.id
     )
 
-    deliver_wireguard_trial_via_api(
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("wgtrial:retry:")
+)
+def cb_wg_trial_retry(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+
+    try:
+        trial_id = int(call.data.split(":")[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "شناسه درخواست نامعتبر است.", show_alert=True)
+        return
+
+    trial = get_wireguard_trial_by_id(trial_id)
+    if not trial:
+        bot.answer_callback_query(call.id, "درخواست تست پیدا نشد.", show_alert=True)
+        return
+    if trial["status"] == "delivered":
+        bot.answer_callback_query(call.id, "این تست قبلاً تحویل شده است.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "تلاش مجدد شروع شد...")
+    bot.send_message(
         call.from_user.id,
-        target_id
+        f"⏳ در حال تلاش مجدد برای تحویل تست کاربر <code>{trial['user_id']}</code>."
+    )
+    deliver_wireguard_trial_via_api(
+        trial["user_id"],
+        trial_id,
+        requested_by_admin=call.from_user.id
     )
 
 
@@ -10454,8 +10777,233 @@ def cb_admin_home(call):
         call,
         "🛠 <b>پنل مدیریت</b>\n\n"
         "بخش موردنظر را انتخاب کنید:",
-        admin_panel_keyboard(call.from_user.id)
+        admin_panel_keyboard(
+            call.from_user.id,
+            call.message.chat.id if call.message else call.from_user.id
+        )
     )
+
+
+def _admin_callback_is_private(call):
+    if call.message and getattr(call.message.chat, "type", None) == "private":
+        return True
+
+    bot.answer_callback_query(
+        call.id,
+        "این بخش فقط در گفت‌وگوی خصوصی ادمین در دسترس است.",
+        show_alert=True
+    )
+    if call.message:
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None
+            )
+        except Exception:
+            pass
+    return False
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:eylan"
+)
+def cb_admin_eylan(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+    bot.answer_callback_query(call.id, "وضعیت پنل بروزرسانی شد.")
+    edit_or_send(
+        call,
+        eylan_admin_dashboard_text(),
+        eylan_admin_dashboard_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:eylan:local"
+)
+def cb_admin_eylan_local(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به مدیریت EylanPanel",
+            callback_data="admin:eylan"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 پنل مدیریت",
+            callback_data="admin:home"
+        )
+    )
+    bot.answer_callback_query(call.id)
+    edit_or_send(call, eylan_local_services_text(), kb)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:trial_quota"
+)
+def cb_admin_trial_quota(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    set_admin_state(call.from_user.id, "trial_quota_wait_user_id", {})
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id,
+        "🧪 برای مدیریت سهمیه تست، آیدی عددی کاربر را ارسال کنید.\n"
+        "برای لغو، /cancel بفرستید."
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("trialquota:set:")
+)
+def cb_trial_quota_set(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        user_id = int(call.data.split(":")[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "آیدی کاربر نامعتبر است.", show_alert=True)
+        return
+    if not get_user_row(user_id):
+        bot.answer_callback_query(call.id, "کاربر پیدا نشد.", show_alert=True)
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "trial_quota_wait_count",
+        {"user_id": user_id}
+    )
+    bot.answer_callback_query(call.id)
+    bot.send_message(
+        call.message.chat.id if call.message else call.from_user.id,
+        "✏️ تعداد کل تست‌های مجاز را به‌صورت عدد صحیح از ۰ تا ۱٬۰۰۰٬۰۰۰ ارسال کنید.\n"
+        "تست‌های تحویل‌شده در تاریخچه باقی می‌مانند؛ این مقدار فقط سهمیه دریافت‌های مجاز را تنظیم می‌کند.\n"
+        "برای لغو، /cancel بفرستید."
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("trialquota:refresh:")
+)
+def cb_trial_quota_refresh(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        user_id = int(call.data.split(":")[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "آیدی کاربر نامعتبر است.", show_alert=True)
+        return
+    text = admin_trial_quota_text(user_id)
+    if text is None:
+        bot.answer_callback_query(call.id, "کاربر پیدا نشد.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id, "اطلاعات بروزرسانی شد.")
+    edit_or_send(call, text, admin_trial_quota_keyboard(user_id))
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("trialquota:adjust:")
+)
+def cb_trial_quota_adjust(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _, _, user_id_raw, delta_raw = call.data.split(":")
+        user_id = int(user_id_raw)
+        delta = int(delta_raw)
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "اطلاعات سهمیه نامعتبر است.", show_alert=True)
+        return
+    if delta not in {-1, 1} or not get_user_row(user_id):
+        bot.answer_callback_query(call.id, "کاربر یا مقدار تغییر نامعتبر است.", show_alert=True)
+        return
+
+    allowed = adjust_wireguard_trial_allowance(
+        user_id,
+        delta,
+        call.from_user.id
+    )
+    text = admin_trial_quota_text(user_id)
+    bot.answer_callback_query(
+        call.id,
+        f"سهمیه مجاز اکنون {allowed} تست است."
+    )
+    edit_or_send(call, text, admin_trial_quota_keyboard(user_id))
+
+
+def handle_trial_quota_user_id(message):
+    if message.content_type != "text":
+        bot.send_message(message.chat.id, "لطفاً آیدی عددی کاربر را به‌صورت متن بفرستید.")
+        return
+
+    raw = (message.text or "").translate(DIGIT_TRANSLATION).strip()
+    if not raw.isdigit():
+        bot.send_message(message.chat.id, "❌ آیدی معتبر نیست؛ فقط عدد وارد کنید.")
+        return
+
+    user_id = int(raw)
+    if not get_user_row(user_id):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ کاربری با این آیدی در دیتابیس ربات پیدا نشد. آیدی را دوباره وارد کنید."
+        )
+        return
+
+    clear_admin_state(message.from_user.id)
+    show_admin_trial_quota(message.chat.id, user_id)
+
+
+def handle_trial_quota_count(message, state):
+    if message.content_type != "text":
+        bot.send_message(message.chat.id, "لطفاً تعداد سهمیه را به‌صورت عدد و متن ارسال کنید.")
+        return
+
+    raw = (message.text or "").translate(DIGIT_TRANSLATION).strip()
+    if not raw.isdigit() or len(raw) > 7:
+        bot.send_message(
+            message.chat.id,
+            "❌ مقدار نامعتبر است؛ عددی از ۰ تا ۱٬۰۰۰٬۰۰۰ وارد کنید."
+        )
+        return
+
+    allowed_count = int(raw)
+    if allowed_count > 1_000_000:
+        bot.send_message(
+            message.chat.id,
+            "❌ حداکثر سهمیه قابل تنظیم ۱٬۰۰۰٬۰۰۰ تست است."
+        )
+        return
+
+    user_id = int(state["data"].get("user_id", 0))
+    if not get_user_row(user_id):
+        clear_admin_state(message.from_user.id)
+        bot.send_message(message.chat.id, "⚠️ کاربر پیدا نشد؛ دوباره از پنل اقدام کنید.")
+        return
+
+    set_wireguard_trial_allowance(
+        user_id,
+        allowed_count,
+        message.from_user.id
+    )
+    clear_admin_state(message.from_user.id)
+    bot.send_message(
+        message.chat.id,
+        f"✅ تعداد کل تست‌های مجاز کاربر <code>{user_id}</code> روی "
+        f"<b>{allowed_count}</b> تنظیم شد."
+    )
+    show_admin_trial_quota(message.chat.id, user_id)
 
 
 @bot.callback_query_handler(
@@ -11971,7 +12519,10 @@ def cb_admin_db_restore_no(call):
     bot.send_message(
         call.from_user.id,
         "✅ بازگردانی دیتابیس لغو شد. اطلاعات فعلی تغییری نکرد.",
-        reply_markup=admin_panel_keyboard(call.from_user.id)
+        reply_markup=admin_panel_keyboard(
+            call.from_user.id,
+            call.message.chat.id if call.message else call.from_user.id
+        )
     )
 
 
@@ -12108,7 +12659,7 @@ def cb_admin_db_restore_yes(call):
         f"👥 کاربران: {state['data'].get('users', 0)}\n"
         f"📦 سفارش‌ها: {state['data'].get('orders', 0)}\n"
         f"🛠 سرویس‌های فعال: {state['data'].get('services', 0)}",
-        reply_markup=admin_panel_keyboard(admin_id)
+        reply_markup=admin_panel_keyboard(admin_id, admin_id)
     )
 
 
@@ -12420,7 +12971,10 @@ def cb_admin_maintenance_toggle(call):
         call,
         "🛠 <b>پنل مدیریت</b>\n\n"
         "بخش موردنظر را انتخاب کنید:",
-        admin_panel_keyboard(call.from_user.id)
+        admin_panel_keyboard(
+            call.from_user.id,
+            call.message.chat.id if call.message else call.from_user.id
+        )
     )
 
 
@@ -12797,7 +13351,7 @@ def handle_price_edit_message(message, state):
         bot.send_message(
             message.chat.id,
             "❌ محصول پیدا نشد. دوباره از «💲 تغییر قیمت سرویس‌ها» شروع کنید.",
-            reply_markup=admin_panel_keyboard(admin_id)
+            reply_markup=admin_panel_keyboard(admin_id, message.chat.id)
         )
         return
 
@@ -13493,9 +14047,17 @@ def admin_state_message(message):
         bot.send_message(
             message.chat.id,
             "✅ عملیات لغو شد.",
-            reply_markup=admin_panel_keyboard(message.from_user.id)
+            reply_markup=admin_panel_keyboard(message.from_user.id, message.chat.id)
         )
 
+        return
+
+    if mode == "trial_quota_wait_user_id":
+        handle_trial_quota_user_id(message)
+        return
+
+    if mode == "trial_quota_wait_count":
+        handle_trial_quota_count(message, state)
         return
 
     if mode == "db_restore_wait_file":
@@ -14098,7 +14660,7 @@ def cancel_command(message):
         bot.send_message(
             message.chat.id,
             "✅ عملیات لغو شد.",
-            reply_markup=admin_panel_keyboard(message.from_user.id)
+            reply_markup=admin_panel_keyboard(message.from_user.id, message.chat.id)
         )
 
 
@@ -14120,12 +14682,21 @@ def user_text_router(message):
     ):
         return
 
-    if not ensure_joined(message):
-        return
-
     nav = get_nav(
         message.from_user.id
     )
+
+    if nav["state"] in {"awaiting_service_username", "wireguard_trial_username"}:
+        if not ensure_joined(message):
+            return
+        if nav["state"] == "awaiting_service_username":
+            _handle_service_username(message, nav)
+        else:
+            _handle_wireguard_trial_username(message, nav)
+        return
+
+    if not ensure_joined(message):
+        return
 
     if nav["state"] == "support_sending":
 
@@ -14177,24 +14748,6 @@ def user_text_router(message):
     if nav["state"] == "personal_ai_gmail":
 
         _handle_personal_ai_gmail(
-            message,
-            nav
-        )
-
-        return
-
-    if nav["state"] == "awaiting_service_username":
-
-        _handle_service_username(
-            message,
-            nav
-        )
-
-        return
-
-    if nav["state"] == "wireguard_trial_username":
-
-        _handle_wireguard_trial_username(
             message,
             nav
         )
@@ -14548,82 +15101,19 @@ def send_service_username_prompt(
     order,
     intro=""
 ):
-    """
-    درخواست نام کاربری سرویس.
-
-    اگر کاربر قبلاً با یک نام کاربری خرید موفق داشته، آن نام کاربری همراه با
-    دکمه‌های «بله / خیر» نمایش داده می‌شود؛ وگرنه همان پیام همیشگی ارسال می‌شود.
-    """
-
-    service = service_for_product(
-        order["product_id"]
-    )
-
-    last_username = get_last_service_username(
-        user_id,
-        service,
-        exclude_order_id=order["id"]
-    )
-
-    if not last_username:
-
-        bot.send_message(
-            chat_id,
-            f"{intro}{SERVICE_USERNAME_PROMPT}",
-            reply_markup=reply_back_keyboard()
-        )
-
-        return
-
-    # نام کاربری پیشنهادی را در nav نگه می‌داریم تا با زدن «بله» دقیقاً همان
-    # مقداری که به کاربر نشان داده شد ثبت شود.
-    nav = get_nav(
-        user_id
-    )
-
-    nav_data = dict(
-        nav["data"]
-    )
-
-    nav_data["suggested_username"] = last_username
-
-    save_nav(
-        user_id,
-        nav["state"],
-        nav["parent_state"],
-        nav_data
-    )
-
+    # درخواست نام کاربری عمداً کوتاه است و Reply Keyboard هنگام ورود مخفی
+    # می‌شود تا دکمه‌های خانه/بازگشت کاربر را از این مرحله خارج نکنند.
     if intro.strip():
-
         bot.send_message(
             chat_id,
             intro.strip(),
-            reply_markup=reply_back_keyboard()
+            reply_markup=remove_keyboard()
         )
-
-    kb = types.InlineKeyboardMarkup(
-        row_width=2
-    )
-
-    kb.row(
-        types.InlineKeyboardButton(
-            "✅ بله، همین است",
-            callback_data=f"reuse_uname:yes:{order['id']}"
-        ),
-        types.InlineKeyboardButton(
-            "❌ خیر",
-            callback_data=f"reuse_uname:no:{order['id']}"
-        )
-    )
 
     bot.send_message(
         chat_id,
-        "👤 <b>آیا دفعه پیش با این نام کاربری خرید کرده بودید؟</b>\n\n"
-        f"<b>{esc(last_username)}</b>\n\n"
-        "اگر بله، همین نام کاربری برای این سفارش هم ثبت می‌شود.\n"
-        "اگر خیر، دکمه «❌ خیر» را بزنید و نام کاربری موردنظر را ارسال کنید.",
-        reply_markup=kb
+        SERVICE_USERNAME_PROMPT,
+        reply_markup=remove_keyboard()
     )
 
 
@@ -14731,8 +15221,8 @@ def cb_reuse_username(call):
 
         bot.send_message(
             call.message.chat.id,
-            "👤 پس نام کاربری مورد نظر خود را ارسال کنید:",
-            reply_markup=reply_back_keyboard()
+            SERVICE_USERNAME_PROMPT,
+            reply_markup=remove_keyboard()
         )
 
 
@@ -14744,17 +15234,12 @@ def _handle_service_username(
         message.text or ""
     ).strip()
 
-    if (
-        not username
-        or len(username) > 64
-    ):
-
+    if not USERNAME_RE.fullmatch(username):
         bot.send_message(
             message.chat.id,
-            "❌ نام کاربری نامعتبر است. "
-            "لطفاً یک نام کاربری معتبر ارسال کنید:"
+            USERNAME_INVALID_PROMPT,
+            reply_markup=remove_keyboard()
         )
-
         return
 
     _process_service_username(
@@ -14771,6 +15256,15 @@ def _process_service_username(
     username,
     nav_data
 ):
+    username = (username or "").strip()
+    if not USERNAME_RE.fullmatch(username):
+        bot.send_message(
+            chat_id,
+            USERNAME_INVALID_PROMPT,
+            reply_markup=remove_keyboard()
+        )
+        return
+
     order_id = int(
         nav_data.get(
             "order_id",
@@ -14931,89 +15425,42 @@ def _process_service_username(
     )
 
 
-def _handle_wireguard_trial_username(
-    message,
-    nav
-):
-    username = (
-        message.text or ""
-    ).strip()
-
-    if (
-        not username
-        or len(username) > 64
-    ):
-
+def _handle_wireguard_trial_username(message, nav):
+    username = (message.text or "").strip()
+    if not USERNAME_RE.fullmatch(username):
         bot.send_message(
             message.chat.id,
-            "❌ نام کاربری نامعتبر است. "
-            "لطفاً یک نام کاربری معتبر ارسال کنید:"
+            USERNAME_INVALID_PROMPT,
+            reply_markup=remove_keyboard()
         )
-
         return
 
-    if has_wireguard_trial(
-        message.from_user.id
-    ):
-
-        save_nav(
-            message.from_user.id,
-            "home",
-            None,
-            {}
-        )
-
+    user_id = message.from_user.id
+    trial_id = create_wireguard_trial(user_id, username)
+    if not trial_id:
+        quota = wireguard_trial_quota_status(user_id)
+        save_nav(user_id, "home", None, {})
+        if quota["in_progress"]:
+            response = "⏳ درخواست تست شما در حال آماده‌سازی است؛ لطفاً کمی صبر کنید."
+        else:
+            response = (
+                "❌ شما سهمیه تست استفاده‌نشده ندارید. هر کاربر فقط به تعداد "
+                "تست‌های مجاز برای خودش می‌تواند اکانت دریافت کند."
+            )
         bot.send_message(
             message.chat.id,
-            "❌ شما قبلاً از اکانت تست وایرساک استفاده کرده‌اید.\n"
-            "هر اکانت تلگرام فقط یک‌بار می‌تواند اکانت تست دریافت کند.",
+            response,
             reply_markup=reply_main_keyboard()
         )
-
         return
 
-    created = create_wireguard_trial(
-        message.from_user.id,
-        username
-    )
-
-    if not created:
-
-        save_nav(
-            message.from_user.id,
-            "home",
-            None,
-            {}
-        )
-
-        bot.send_message(
-            message.chat.id,
-            "❌ شما قبلاً از اکانت تست وایرساک استفاده کرده‌اید.\n"
-            "هر اکانت تلگرام فقط یک‌بار می‌تواند اکانت تست دریافت کند.",
-            reply_markup=reply_main_keyboard()
-        )
-
-        return
-
-    save_nav(
-        message.from_user.id,
-        "home",
-        None,
-        {}
-    )
-
+    save_nav(user_id, "home", None, {})
     bot.send_message(
         message.chat.id,
-        f"✅ درخواست اکانت تست با نام کاربری "
-        f"<b>{esc(username)}</b> ثبت شد.\n"
-        "به‌زودی توسط پشتیبانی برای شما ارسال می‌شود.",
-        reply_markup=reply_main_keyboard()
+        "✅ نام کاربری ثبت شد؛ اکانت تست شما اکنون به‌صورت خودکار آماده می‌شود.",
+        reply_markup=remove_keyboard()
     )
-
-    notify_admins_wireguard_trial(
-        message.from_user.id,
-        username
-    )
+    deliver_wireguard_trial_via_api(user_id, trial_id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -15087,6 +15534,10 @@ def receipt_or_draft_handler(message):
     nav = get_nav(
         message.from_user.id
     )
+
+    if nav["state"] in {"awaiting_service_username", "wireguard_trial_username"}:
+        remind_user_to_enter_username(message.chat.id)
+        return
 
     if nav["state"] == "support_sending":
 
@@ -15303,6 +15754,10 @@ def media_fallback(message):
     nav = get_nav(
         message.from_user.id
     )
+
+    if nav["state"] in {"awaiting_service_username", "wireguard_trial_username"}:
+        remind_user_to_enter_username(message.chat.id)
+        return
 
     if nav["state"] == "support_sending":
 
