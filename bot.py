@@ -340,6 +340,9 @@ AKHAVAN_PROFIT_DEFAULT_RATES = {
         "wireguard-50gb-1m": 25000,
         "wireguard-100gb-1m": 50000,
         "wireguard-200gb-1m": 100000,
+        "chatgpt-shared-15": 25000,
+        "chatgpt-shared-10": 37500,
+        "chatgpt-shared-5": 50000,
     },
     "per_gb": {
         "v2ray": 750,
@@ -364,8 +367,8 @@ V2RAY_GB_RE = re.compile(
 def akhavan_profit_for_product(product_id):
     """
     سود اخوان از فروش یک محصول (تومان).
-    وایرساک: مبلغ ثابت هر پلن — V2Ray: نرخ هر گیگ × حجم پلن.
-    محصولاتی که نرخ ندارند (مثلاً هوش مصنوعی) سود صفر دارند.
+    وایرساک و اکانت‌های اشتراکی ChatGPT: مبلغ ثابت هر پلن.
+    V2Ray: نرخ هر گیگ × حجم پلن. محصولاتی که نرخ ندارند سود صفر دارند.
     """
 
     fixed = AKHAVAN_PROFIT_RATES.get("fixed") or {}
@@ -1573,6 +1576,129 @@ def set_wireguard_trial_allowance(user_id, allowed_count, admin_id):
             (user_id, allowed_count, admin_id, now())
         )
     return allowed_count
+
+
+def reset_all_wireguard_trial_quotas(admin_id):
+    """Give every user exactly one usable trial from this point forward.
+
+    Users who have never received a trial keep their single default grant.
+    Users with at least one delivered trial receive one new grant. Existing
+    pending/provisioning requests are never cancelled or counted twice.
+    Per-user manual allowances are intentionally normalized by this reset.
+    """
+
+    reset_at = now()
+
+    with db() as conn:
+        # Serialize against create_wireguard_trial() so a request cannot slip
+        # between counting existing reservations and writing the new limits.
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            """
+            WITH audience(user_id) AS (
+                SELECT user_id FROM users
+                UNION
+                SELECT user_id FROM wireguard_trial_quotas
+                UNION
+                SELECT user_id FROM wireguard_trials
+            ),
+            usage AS (
+                SELECT
+                    user_id,
+                    SUM(CASE WHEN status='delivered' THEN 1 ELSE 0 END) AS delivered,
+                    SUM(
+                        CASE WHEN status IN ('pending', 'provisioning')
+                        THEN 1 ELSE 0 END
+                    ) AS in_progress
+                FROM wireguard_trials
+                GROUP BY user_id
+            )
+            SELECT
+                audience.user_id,
+                COALESCE(usage.delivered, 0) AS delivered,
+                COALESCE(usage.in_progress, 0) AS in_progress
+            FROM audience
+            LEFT JOIN usage ON usage.user_id=audience.user_id
+            ORDER BY audience.user_id
+            """
+        ).fetchall()
+
+        quota_rows = []
+        renewed_users = 0
+        ready_users = 0
+        in_progress_users = 0
+
+        for row in rows:
+            delivered = int(row["delivered"] or 0)
+            in_progress = int(row["in_progress"] or 0)
+
+            if delivered > 0:
+                # All historical deliveries remain in the ledger; one new
+                # unused grant is placed after them and any active request.
+                allowed = delivered + in_progress + 1
+                renewed_users += 1
+            else:
+                # A user who never received a test still has only one test.
+                # Preserve already-reserved requests instead of cancelling one.
+                allowed = max(1, in_progress)
+
+            if in_progress:
+                in_progress_users += 1
+            else:
+                ready_users += 1
+
+            quota_rows.append(
+                (int(row["user_id"]), allowed, admin_id, reset_at)
+            )
+
+        conn.executemany(
+            """
+            INSERT INTO wireguard_trial_quotas(
+                user_id, allowed_count, updated_by, updated_at
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                allowed_count=excluded.allowed_count,
+                updated_by=excluded.updated_by,
+                updated_at=excluded.updated_at
+            """,
+            quota_rows
+        )
+
+        result = {
+            "reset_at": reset_at,
+            "admin_id": int(admin_id),
+            "total_users": len(rows),
+            "renewed_users": renewed_users,
+            "ready_users": ready_users,
+            "in_progress_users": in_progress_users,
+        }
+        conn.execute(
+            """
+            INSERT INTO bot_settings(key, value, updated_at)
+            VALUES ('trial_quota_last_global_reset', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value=excluded.value,
+                updated_at=excluded.updated_at
+            """,
+            (json.dumps(result, ensure_ascii=False), reset_at)
+        )
+
+    return result
+
+
+def get_last_wireguard_trial_quota_reset():
+    raw = get_setting("trial_quota_last_global_reset")
+    if not raw:
+        return None
+
+    try:
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (TypeError, ValueError):
+        return None
 
 
 def mark_wireguard_trial_delivered(trial_id, admin_id, panel_link):
@@ -6065,6 +6191,67 @@ def admin_panel_keyboard(admin_id=None, chat_id=None):
     return kb
 
 
+def admin_trial_quota_menu_text():
+    lines = [
+        "🧪 <b>مدیریت سهمیه اکانت تست</b>",
+        "",
+        "از این بخش می‌توانید سهمیه یک کاربر را جداگانه تغییر دهید یا سهمیه "
+        "همه کاربران را یک‌جا ریست کنید.",
+        "",
+        "♻️ <b>ریست همگانی</b>:",
+        "• کاربری که هنوز تست تحویل نگرفته، همان یک فرصت را خواهد داشت.",
+        "• کاربری که قبلاً تست تحویل گرفته، دوباره دقیقاً یک فرصت تازه می‌گیرد.",
+        "• سهمیه‌های دستی قبلی به یک فرصت قابل دریافت از این لحظه تبدیل می‌شوند.",
+        "• تاریخچه تست‌ها حذف نمی‌شود و درخواست در حال آماده‌سازی لغو نمی‌شود.",
+    ]
+
+    last_reset = get_last_wireguard_trial_quota_reset()
+    if last_reset:
+        lines.extend([
+            "",
+            "🕓 <b>آخرین ریست همگانی</b>",
+            f"زمان: {esc(jalali_datetime_str(last_reset.get('reset_at')))}",
+            f"تعداد کاربران: <b>{int(last_reset.get('total_users', 0))}</b>",
+            f"دارای تست قبلی: <b>{int(last_reset.get('renewed_users', 0))}</b>",
+        ])
+
+    return "\n".join(lines)
+
+
+def admin_trial_quota_menu_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "👤 مدیریت سهمیه یک کاربر",
+            callback_data="trialquota:user"
+        ),
+        types.InlineKeyboardButton(
+            "♻️ ریست سهمیه همه کاربران",
+            callback_data="trialquota:reset:ask"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+    return kb
+
+
+def admin_trial_quota_reset_confirm_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "✅ بله، سهمیه همه ریست شود",
+            callback_data="trialquota:reset:confirm"
+        ),
+        types.InlineKeyboardButton(
+            "❌ انصراف",
+            callback_data="admin:trial_quota"
+        )
+    )
+    return kb
+
+
 def admin_trial_quota_keyboard(user_id):
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.row(
@@ -6089,8 +6276,8 @@ def admin_trial_quota_keyboard(user_id):
             callback_data=f"trialquota:refresh:{user_id}"
         ),
         types.InlineKeyboardButton(
-            "⬅️ بازگشت به پنل",
-            callback_data="admin:home"
+            "⬅️ بازگشت به مدیریت تست",
+            callback_data="admin:trial_quota"
         )
     )
     return kb
@@ -10853,12 +11040,116 @@ def cb_admin_trial_quota(call):
     if call.from_user.id not in ADMIN_IDS:
         bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
         return
+    if not _admin_callback_is_private(call):
+        return
+
+    clear_admin_state(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    edit_or_send(
+        call,
+        admin_trial_quota_menu_text(),
+        admin_trial_quota_menu_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "trialquota:user"
+)
+def cb_trial_quota_user(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+
     set_admin_state(call.from_user.id, "trial_quota_wait_user_id", {})
     bot.answer_callback_query(call.id)
-    bot.send_message(
-        call.message.chat.id,
-        "🧪 برای مدیریت سهمیه تست، آیدی عددی کاربر را ارسال کنید.\n"
-        "برای لغو، /cancel بفرستید."
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به مدیریت تست",
+            callback_data="admin:trial_quota"
+        )
+    )
+    edit_or_send(
+        call,
+        "👤 <b>مدیریت سهمیه یک کاربر</b>\n\n"
+        "آیدی عددی کاربر را ارسال کنید.\n"
+        "برای لغو، /cancel بفرستید.",
+        kb
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "trialquota:reset:ask"
+)
+def cb_trial_quota_reset_ask(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+
+    set_admin_state(call.from_user.id, "trial_quota_reset_confirm", {})
+    bot.answer_callback_query(call.id)
+    edit_or_send(
+        call,
+        "⚠️ <b>تأیید ریست سهمیه همه کاربران</b>\n\n"
+        "بعد از تأیید، هر کاربری که قبلاً تست گرفته باشد یک فرصت تازه خواهد داشت؛ "
+        "کاربرانی که هنوز تست نگرفته‌اند همچنان فقط یک فرصت دارند.\n\n"
+        "تاریخچه حذف نمی‌شود و درخواست‌های در حال آماده‌سازی لغو نمی‌شوند. "
+        "تنظیمات دستی سهمیه کاربران نیز با این قانون جایگزین می‌شود.\n\n"
+        "آیا مطمئن هستید؟",
+        admin_trial_quota_reset_confirm_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "trialquota:reset:confirm"
+)
+def cb_trial_quota_reset_confirm(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+
+    state = get_admin_state(call.from_user.id)
+    if not state or state["mode"] != "trial_quota_reset_confirm":
+        bot.answer_callback_query(
+            call.id,
+            "این تأیید منقضی شده است؛ دوباره از مدیریت تست اقدام کنید.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(call.id, "در حال ریست سهمیه‌ها...")
+    try:
+        result = reset_all_wireguard_trial_quotas(call.from_user.id)
+    except Exception:
+        logger.exception(
+            "Failed resetting all wireguard trial quotas by admin %s",
+            call.from_user.id
+        )
+        clear_admin_state(call.from_user.id)
+        edit_or_send(
+            call,
+            "❌ ریست سهمیه‌ها با خطا مواجه شد و هیچ تغییری ذخیره نشد. "
+            "لطفاً دوباره تلاش کنید.",
+            admin_trial_quota_menu_keyboard()
+        )
+        return
+
+    clear_admin_state(call.from_user.id)
+    edit_or_send(
+        call,
+        "✅ <b>سهمیه تست همه کاربران ریست شد.</b>\n\n"
+        f"👥 کل کاربران بررسی‌شده: <b>{result['total_users']}</b>\n"
+        f"🔁 کاربران دارای تست قبلی: <b>{result['renewed_users']}</b>\n"
+        f"🟢 کاربران آماده دریافت: <b>{result['ready_users']}</b>\n"
+        f"⏳ کاربران دارای درخواست فعال: <b>{result['in_progress_users']}</b>\n\n"
+        "از این لحظه کاربران واجد شرایط می‌توانند یک بار تست دریافت کنند.",
+        admin_trial_quota_menu_keyboard()
     )
 
 
