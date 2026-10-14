@@ -697,6 +697,18 @@ def init_db():
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS faq_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                added_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_faq_items_order
+            ON faq_items(sort_order);
+
             CREATE UNIQUE INDEX IF NOT EXISTS idx_akhavan_ledger_order
             ON akhavan_profit_ledger(order_id)
             WHERE order_id IS NOT NULL;
@@ -2300,6 +2312,10 @@ def reply_main_keyboard():
         "📊 وضعیت سرور"
     )
 
+    kb.row(
+        "❓ سوالات متداول"
+    )
+
     return kb
 
 
@@ -2357,6 +2373,10 @@ def main_menu_inline():
         types.InlineKeyboardButton(
             "ℹ️ درباره ما",
             callback_data="about"
+        ),
+        types.InlineKeyboardButton(
+            "❓ سوالات متداول",
+            callback_data="faq"
         )
     )
 
@@ -2471,6 +2491,134 @@ def remove_force_join_channel(channel_row_id):
             "DELETE FROM force_join_channels WHERE id=?",
             (channel_row_id,)
         )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FAQ (❓ سوالات متداول — اضافه/حذف از پنل ادمین)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FAQ_QUESTION_MAX_LEN = 200
+FAQ_ANSWER_MAX_LEN = 3000
+FAQ_PAGE_SIZE = 8
+
+
+def get_faq_items():
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM faq_items
+            ORDER BY sort_order ASC, id ASC
+            """
+        ).fetchall()
+
+    return [dict(row) for row in rows]
+
+
+def get_faq_item(faq_id):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM faq_items WHERE id=?",
+            (faq_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def add_faq_item(question, answer, added_by=None):
+    with db() as conn:
+        max_order = conn.execute(
+            "SELECT COALESCE(MAX(sort_order), -1) AS m FROM faq_items"
+        ).fetchone()["m"]
+
+        cursor = conn.execute(
+            """
+            INSERT INTO faq_items(
+                question,
+                answer,
+                sort_order,
+                added_by,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                question,
+                answer,
+                max_order + 1,
+                added_by,
+                now()
+            )
+        )
+
+        return int(cursor.lastrowid)
+
+
+def remove_faq_item(faq_id):
+    with db() as conn:
+        cursor = conn.execute(
+            "DELETE FROM faq_items WHERE id=?",
+            (faq_id,)
+        )
+
+        return cursor.rowcount > 0
+
+
+def faq_short_label(text, limit=45):
+    flat = " ".join(str(text or "").split())
+
+    if len(flat) <= limit:
+        return flat
+
+    return flat[:limit - 1].rstrip() + "…"
+
+
+def faq_clamp_page(page, total_items):
+    total_pages = max(
+        1,
+        (total_items + FAQ_PAGE_SIZE - 1) // FAQ_PAGE_SIZE
+    )
+
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+
+    return max(0, min(page, total_pages - 1)), total_pages
+
+
+def faq_page_nav_buttons(page, total_pages, prefix):
+    """ردیف دکمه‌های صفحه‌بندی؛ اگر فقط یک صفحه باشد خالی برمی‌گردد."""
+
+    if total_pages <= 1:
+        return []
+
+    buttons = []
+
+    if page > 0:
+        buttons.append(
+            types.InlineKeyboardButton(
+                "◀️ قبلی",
+                callback_data=f"{prefix}:{page - 1}"
+            )
+        )
+
+    buttons.append(
+        types.InlineKeyboardButton(
+            f"{page + 1}/{total_pages}",
+            callback_data="faq:noop"
+        )
+    )
+
+    if page < total_pages - 1:
+        buttons.append(
+            types.InlineKeyboardButton(
+                "بعدی ▶️",
+                callback_data=f"{prefix}:{page + 1}"
+            )
+        )
+
+    return buttons
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -4046,6 +4194,45 @@ def chatgpt_shared_delivery_template(
     )
 
 
+CHATGPT_SHARED_NOTICE_TEXT = (
+    "✅ اطلاعیه شماه یک ❌\n\n\n"
+    "🌟 استفاده اشتراکی نیاز به همراهی زیاد و احترام به حقوق بقیه داره؛\n\n"
+    "🚫 لطفا از «شکن» و «۴۰۳» برای لاگین و کار با gpt استفاده نکنید. "
+    "VPNهای معتبر توصیه ماست.\n"
+    "🚫 چت بقیه رو نخوانید.\n"
+    "🚫 به هیچ وجه چت باقی کاربران رو پاک نکنید، به هیچ وجه!\n\n"
+    "🔒 سعی کنید اطلاعات خصوصی و شخصی خودتون رو در چت ننویسید و اگر نوشتین پاک کنید.\n"
+    "🔑 توصیه میکنیم رمز یا توکن به سرویس ارسال نکنید، اگر ارسال کردید "
+    "تغییرش بدید یا چت رو پاک کنید."
+)
+
+
+def chatgpt_shared_notice_template():
+    return CHATGPT_SHARED_NOTICE_TEXT
+
+
+def send_chatgpt_shared_notice(user_id):
+    """
+    پیام دوم (اطلاعیه قوانین استفاده اشتراکی) را جداگانه برای مشتری می‌فرستد.
+
+    عمداً خطاها را اینجا می‌گیریم تا اگر ارسال این پیام به هر دلیل شکست خورد،
+    تحویل اصلی سفارش (پیام اول) و ثبت تکمیل سفارش خراب نشود.
+    """
+    try:
+        bot.send_message(
+            user_id,
+            chatgpt_shared_notice_template()
+        )
+        return True
+
+    except Exception:
+        logger.exception(
+            "Failed sending ChatGPT shared notice to user %s",
+            user_id
+        )
+        return False
+
+
 def chatgpt_personal_delivery_template(
     gmail_address
 ):
@@ -5373,6 +5560,11 @@ def deliver_order_payload(
                     reply_markup=kb
                 )
 
+                # پیام دوم: اطلاعیه قوانین استفاده اشتراکی (جداگانه و همان لحظه)
+                send_chatgpt_shared_notice(
+                    order["user_id"]
+                )
+
                 complete_order(
                     order_id
                 )
@@ -5687,6 +5879,11 @@ def admin_assign_new_gmail(
             svc["user_id"],
             delivery_msg,
             reply_markup=kb
+        )
+
+        # پیام دوم: اطلاعیه قوانین استفاده اشتراکی (جداگانه و همان لحظه)
+        send_chatgpt_shared_notice(
+            svc["user_id"]
         )
 
         bot.send_message(
@@ -6160,6 +6357,13 @@ def admin_panel_keyboard(admin_id=None, chat_id=None):
         types.InlineKeyboardButton(
             "🛠 خاموش کردن ربات" if not maintenance_on else "✅ روشن کردن ربات",
             callback_data="admin:maintenance_toggle"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "❓ سوالات متداول",
+            callback_data="admin:faq"
         )
     )
 
@@ -10128,6 +10332,192 @@ def cb_about(call):
         f"ℹ️ <b>درباره ما</b>\n\n"
         f"{esc(ABOUT_TEXT)}",
         bottom_keyboard=reply_back_keyboard()
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FAQ — USER SIDE (❓ سوالات متداول)
+# ══════════════════════════════════════════════════════════════════════════════
+
+FAQ_EMPTY_TEXT = (
+    "❓ <b>سوالات متداول</b>\n\n"
+    "هنوز سوالی ثبت نشده است. اگر سوالی دارید، از بخش «🎧 پشتیبانی» بپرسید."
+)
+
+
+def faq_user_list_text(page=0):
+    items = get_faq_items()
+
+    if not items:
+        return FAQ_EMPTY_TEXT
+
+    return (
+        "❓ <b>سوالات متداول</b>\n\n"
+        "سوال موردنظر خود را انتخاب کنید تا پاسخ آن را ببینید 👇"
+    )
+
+
+def faq_user_list_keyboard(page=0):
+    items = get_faq_items()
+
+    if not items:
+        return None
+
+    page, total_pages = faq_clamp_page(page, len(items))
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    start = page * FAQ_PAGE_SIZE
+
+    for item in items[start:start + FAQ_PAGE_SIZE]:
+        kb.add(
+            types.InlineKeyboardButton(
+                f"❓ {faq_short_label(item['question'])}",
+                callback_data=f"faq:q:{item['id']}:{page}"
+            )
+        )
+
+    nav_buttons = faq_page_nav_buttons(page, total_pages, "faq:p")
+
+    if nav_buttons:
+        kb.row(*nav_buttons)
+
+    return kb
+
+
+def show_faq_menu(chat_id, user_id):
+    save_nav(
+        user_id,
+        "faq",
+        "home",
+        {}
+    )
+
+    bot.send_message(
+        chat_id,
+        faq_user_list_text(),
+        reply_markup=faq_user_list_keyboard(0)
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "faq"
+)
+def cb_faq_open(call):
+    bot.answer_callback_query(
+        call.id
+    )
+
+    save_nav(
+        call.from_user.id,
+        "faq",
+        "home",
+        {}
+    )
+
+    edit_or_send(
+        call,
+        faq_user_list_text(),
+        faq_user_list_keyboard(0)
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "faq:noop"
+)
+def cb_faq_noop(call):
+    bot.answer_callback_query(
+        call.id
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("faq:p:")
+)
+def cb_faq_page(call):
+    bot.answer_callback_query(
+        call.id
+    )
+
+    try:
+        page = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        page = 0
+
+    edit_or_send(
+        call,
+        faq_user_list_text(),
+        faq_user_list_keyboard(page)
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("faq:q:")
+)
+def cb_faq_question(call):
+    parts = call.data.split(":")
+
+    try:
+        faq_id = int(parts[2])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(
+            call.id,
+            "نامعتبر.",
+            show_alert=True
+        )
+        return
+
+    try:
+        page = int(parts[3])
+    except (IndexError, ValueError):
+        page = 0
+
+    item = get_faq_item(faq_id)
+
+    if not item:
+        bot.answer_callback_query(
+            call.id,
+            "این سوال دیگر وجود ندارد.",
+            show_alert=True
+        )
+
+        edit_or_send(
+            call,
+            faq_user_list_text(),
+            faq_user_list_keyboard(0)
+        )
+
+        return
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به سوالات متداول",
+            callback_data=f"faq:p:{page}"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🎧 ارتباط با پشتیبانی",
+            url=support_url()
+        )
+    )
+
+    edit_or_send(
+        call,
+        f"❓ <b>{esc(item['question'])}</b>\n\n"
+        f"{esc(item['answer'])}",
+        kb
     )
 
 
@@ -14287,6 +14677,365 @@ def cb_akhavan_file(call):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: FAQ (❓ سوالات متداول) — همه‌ی ادمین‌ها می‌توانند اضافه/حذف کنند
+# ══════════════════════════════════════════════════════════════════════════════
+
+def admin_faq_text(page=0):
+    items = get_faq_items()
+
+    lines = [
+        "❓ <b>سوالات متداول</b>",
+        "",
+        "سوالاتی که اینجا ثبت می‌کنید در بخش «❓ سوالات متداول» ربات برای همه‌ی "
+        "کاربران نمایش داده می‌شود. هر سوال را می‌توانید جداگانه اضافه یا حذف کنید.",
+        "",
+        f"تعداد سوالات ثبت‌شده: <b>{len(items)}</b>",
+    ]
+
+    if not items:
+        lines.append("\nهیچ سوالی ثبت نشده است. با «➕ افزودن سوال» شروع کنید.")
+        return "\n".join(lines)
+
+    page, _total_pages = faq_clamp_page(page, len(items))
+    start = page * FAQ_PAGE_SIZE
+
+    lines.append("\n📋 لیست سوالات:")
+
+    for number, item in enumerate(
+        items[start:start + FAQ_PAGE_SIZE],
+        start=start + 1
+    ):
+        lines.append(
+            f"{number}. {esc(faq_short_label(item['question'], 70))}"
+        )
+
+    return "\n".join(lines)
+
+
+def admin_faq_keyboard(page=0):
+    items = get_faq_items()
+    page, total_pages = faq_clamp_page(page, len(items))
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    start = page * FAQ_PAGE_SIZE
+
+    for number, item in enumerate(
+        items[start:start + FAQ_PAGE_SIZE],
+        start=start + 1
+    ):
+        kb.add(
+            types.InlineKeyboardButton(
+                f"🗑 حذف {number}: {faq_short_label(item['question'], 30)}",
+                callback_data=f"admin:faq_del:{item['id']}:{page}"
+            )
+        )
+
+    nav_buttons = faq_page_nav_buttons(page, total_pages, "admin:faq_p")
+
+    if nav_buttons:
+        kb.row(*nav_buttons)
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "➕ افزودن سوال",
+            callback_data="admin:faq_add"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:faq"
+)
+def cb_admin_faq(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    clear_admin_state(
+        call.from_user.id
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    edit_or_send(
+        call,
+        admin_faq_text(0),
+        admin_faq_keyboard(0)
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:faq_p:")
+)
+def cb_admin_faq_page(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        page = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        page = 0
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    edit_or_send(
+        call,
+        admin_faq_text(page),
+        admin_faq_keyboard(page)
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:faq_add"
+)
+def cb_admin_faq_add(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "faq_add_question",
+        {}
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data="admin:faq"
+        )
+    )
+
+    edit_or_send(
+        call,
+        "➕ <b>افزودن سوال متداول</b>\n\n"
+        "مرحله ۱ از ۲: <b>متن سوال</b> را بفرستید.\n"
+        f"(حداکثر {FAQ_QUESTION_MAX_LEN} حرف)\n\n"
+        "برای لغو /cancel بفرستید.",
+        kb
+    )
+
+
+def handle_faq_add_question_message(message):
+    admin_id = message.from_user.id
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "❌ فقط متن قابل قبول است. متن سوال را بفرستید یا /cancel بزنید."
+        )
+        return
+
+    question = (message.text or "").strip()
+
+    if not question:
+        bot.send_message(
+            message.chat.id,
+            "❌ متن سوال خالی است. دوباره بفرستید یا /cancel بزنید."
+        )
+        return
+
+    if len(question) > FAQ_QUESTION_MAX_LEN:
+        bot.send_message(
+            message.chat.id,
+            f"❌ متن سوال بیش از حد طولانی است ({len(question)} حرف). "
+            f"حداکثر {FAQ_QUESTION_MAX_LEN} حرف مجاز است؛ کوتاه‌تر بفرستید."
+        )
+        return
+
+    set_admin_state(
+        admin_id,
+        "faq_add_answer",
+        {"question": question}
+    )
+
+    bot.send_message(
+        message.chat.id,
+        "✅ سوال دریافت شد:\n"
+        f"<b>{esc(question)}</b>\n\n"
+        "مرحله ۲ از ۲: حالا <b>متن پاسخ</b> را بفرستید.\n"
+        f"(حداکثر {FAQ_ANSWER_MAX_LEN} حرف)\n\n"
+        "برای لغو /cancel بفرستید."
+    )
+
+
+def handle_faq_add_answer_message(message, state):
+    admin_id = message.from_user.id
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "❌ فقط متن قابل قبول است. متن پاسخ را بفرستید یا /cancel بزنید."
+        )
+        return
+
+    answer = (message.text or "").strip()
+    question = (state.get("data") or {}).get("question")
+
+    if not question:
+        clear_admin_state(admin_id)
+
+        bot.send_message(
+            message.chat.id,
+            "❌ اطلاعات سوال از دست رفت. دوباره از «➕ افزودن سوال» شروع کنید.",
+            reply_markup=admin_faq_keyboard(0)
+        )
+        return
+
+    if not answer:
+        bot.send_message(
+            message.chat.id,
+            "❌ متن پاسخ خالی است. دوباره بفرستید یا /cancel بزنید."
+        )
+        return
+
+    if len(answer) > FAQ_ANSWER_MAX_LEN:
+        bot.send_message(
+            message.chat.id,
+            f"❌ متن پاسخ بیش از حد طولانی است ({len(answer)} حرف). "
+            f"حداکثر {FAQ_ANSWER_MAX_LEN} حرف مجاز است؛ کوتاه‌تر بفرستید."
+        )
+        return
+
+    add_faq_item(
+        question,
+        answer,
+        added_by=admin_id
+    )
+
+    clear_admin_state(admin_id)
+
+    bot.send_message(
+        message.chat.id,
+        "✅ سوال متداول با موفقیت اضافه شد و همین حالا برای کاربران نمایش داده می‌شود.\n\n"
+        + admin_faq_text(10 ** 6),
+        reply_markup=admin_faq_keyboard(10 ** 6)
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:faq_del:")
+)
+def cb_admin_faq_delete_ask(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = call.data.split(":")
+
+    try:
+        faq_id = int(parts[2])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "نامعتبر.", show_alert=True)
+        return
+
+    try:
+        page = int(parts[3])
+    except (IndexError, ValueError):
+        page = 0
+
+    item = get_faq_item(faq_id)
+
+    if not item:
+        bot.answer_callback_query(
+            call.id,
+            "این سوال قبلاً حذف شده است.",
+            show_alert=True
+        )
+
+        edit_or_send(
+            call,
+            admin_faq_text(page),
+            admin_faq_keyboard(page)
+        )
+
+        return
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "✅ بله، حذف شود",
+            callback_data=f"admin:faq_delok:{faq_id}:{page}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ انصراف",
+            callback_data=f"admin:faq_p:{page}"
+        )
+    )
+
+    edit_or_send(
+        call,
+        "🗑 <b>حذف سوال متداول</b>\n\n"
+        "آیا از حذف این سوال مطمئن هستید؟\n\n"
+        f"❓ <b>{esc(item['question'])}</b>\n\n"
+        f"{esc(faq_short_label(item['answer'], 300))}",
+        kb
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:faq_delok:")
+)
+def cb_admin_faq_delete_confirm(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = call.data.split(":")
+
+    try:
+        faq_id = int(parts[2])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "نامعتبر.", show_alert=True)
+        return
+
+    try:
+        page = int(parts[3])
+    except (IndexError, ValueError):
+        page = 0
+
+    removed = remove_faq_item(faq_id)
+
+    bot.answer_callback_query(
+        call.id,
+        "سوال حذف شد ✅" if removed else "این سوال قبلاً حذف شده بود."
+    )
+
+    edit_or_send(
+        call,
+        admin_faq_text(page),
+        admin_faq_keyboard(page)
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN STATE MESSAGE HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -14382,6 +15131,23 @@ def admin_state_message(message):
 
         handle_forcejoin_add_message(
             message
+        )
+
+        return
+
+    if mode == "faq_add_question":
+
+        handle_faq_add_question_message(
+            message
+        )
+
+        return
+
+    if mode == "faq_add_answer":
+
+        handle_faq_add_answer_message(
+            message,
+            state
         )
 
         return
@@ -15111,6 +15877,13 @@ def user_text_router(message):
             f"ℹ️ <b>درباره ما</b>\n\n"
             f"{esc(ABOUT_TEXT)}",
             reply_markup=reply_back_keyboard()
+        )
+
+    elif text == "❓ سوالات متداول":
+
+        show_faq_menu(
+            message.chat.id,
+            message.from_user.id
         )
 
     elif text == "💰 موجودی":
@@ -16482,7 +17255,8 @@ def navigate_back(message):
 
     elif state in (
         "support",
-        "about"
+        "about",
+        "faq"
     ):
 
         send_home(
