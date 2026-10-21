@@ -6364,6 +6364,32 @@ def admin_panel_keyboard(admin_id=None, chat_id=None):
         types.InlineKeyboardButton(
             "❓ سوالات متداول",
             callback_data="admin:faq"
+        ),
+        types.InlineKeyboardButton(
+            "📅 تاریخ سفارشات",
+            callback_data="admin:order_dates"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔎 پروفایل کاربر",
+            callback_data="admin:user_profile"
+        ),
+        types.InlineKeyboardButton(
+            "⏳ سرویس‌های رو به انقضا",
+            callback_data="admin:expiring"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🧾 سفارش‌های در انتظار",
+            callback_data="admin:pending_orders"
+        ),
+        types.InlineKeyboardButton(
+            "📈 گزارش فروش",
+            callback_data="admin:sales"
         )
     )
 
@@ -15036,6 +15062,1119 @@ def cb_admin_faq_delete_confirm(call):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: ORDER DATES (📅 تاریخ سفارشات — تاریخ شمسی و زمان باقی‌مانده‌ی بازه‌ی یک‌ماهه)
+# ══════════════════════════════════════════════════════════════════════════════
+
+ORDER_DATES_STATUS_LABELS = {
+    "awaiting_payment": "در انتظار پرداخت",
+    "awaiting_receipt": "منتظر فیش",
+    "receipt_submitted": "فیش ارسال شده",
+    "paid_pending_fulfillment": "آماده تحویل",
+    "fulfilling": "در حال تحویل",
+    "completed": "تکمیل شده",
+    "rejected": "رد شده",
+    "cancelled": "لغو شده",
+}
+
+_ORDER_NUMBER_DIGITS = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
+    "01234567890123456789"
+)
+
+
+def parse_order_number(text):
+    """«20»، «#20»، «سفارش ۲۰» و … → 20؛ اگر عددی نبود None."""
+
+    normalized = str(text or "").translate(_ORDER_NUMBER_DIGITS)
+    match = re.search(r"\d+", normalized)
+
+    if not match:
+        return None
+
+    value = int(match.group())
+
+    if value <= 0 or value >= 10 ** 12:
+        return None
+
+    return value
+
+
+def _order_dates_parse(value):
+    if not value:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+
+    return parsed.astimezone(timezone.utc)
+
+
+def format_span_fa(delta):
+    total_seconds = int(abs(delta.total_seconds()))
+    days, rest = divmod(total_seconds, 86400)
+    hours = rest // 3600
+
+    if days and hours:
+        return f"{days} روز و {hours} ساعت"
+
+    if days:
+        return f"{days} روز"
+
+    if hours:
+        return f"{hours} ساعت"
+
+    return "کمتر از ۱ ساعت"
+
+
+def _order_dates_period_lines(start_raw, end_raw, now_dt):
+    end_dt = _order_dates_parse(end_raw)
+
+    if end_dt is None:
+        return ["♾ این سرویس تاریخ انقضا ندارد."]
+
+    lines = []
+    start_dt = _order_dates_parse(start_raw)
+
+    if start_dt:
+        lines.append(
+            f"▶️ شروع بازه: <b>{jalali_datetime_str(start_raw)}</b>"
+        )
+
+    lines.append(
+        f"⏹ پایان بازه: <b>{jalali_datetime_str(end_raw)}</b>"
+    )
+
+    if start_dt:
+        total_days = round(
+            (end_dt - start_dt).total_seconds() / 86400
+        )
+
+        lines.append(
+            f"📆 مدت بازه: {total_days} روز"
+        )
+
+        lines.append(
+            "⌛️ سپری‌شده: "
+            f"{format_span_fa(max(now_dt - start_dt, timedelta(0)))}"
+        )
+
+    if end_dt <= now_dt:
+        lines.append(
+            f"❌ <b>منقضی شده</b> ({format_span_fa(now_dt - end_dt)} پیش)"
+        )
+    else:
+        lines.append(
+            f"✅ <b>باقی‌مانده: {format_span_fa(end_dt - now_dt)}</b>"
+        )
+
+    return lines
+
+
+def order_dates_report(order_id, now_dt=None):
+    """
+    گزارش تاریخ یک سفارش برای ادمین؛ اگر سفارش وجود نداشت None.
+
+    تاریخ ثبت و تحویل از خود سفارش خوانده می‌شود (برای همه‌ی سفارش‌ها، حتی
+    قدیمی‌ها)، و بازه‌ی زمانی از سرویس فعالِ ساخته‌شده/تمدیدشده با همین سفارش.
+    """
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    with db() as conn:
+        order = conn.execute(
+            """
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE o.id=?
+            """,
+            (order_id,)
+        ).fetchone()
+
+        if not order:
+            return None
+
+        order = dict(order)
+
+        own_service = conn.execute(
+            """
+            SELECT *
+            FROM active_services
+            WHERE order_id=?
+            ORDER BY id
+            LIMIT 1
+            """,
+            (order_id,)
+        ).fetchone()
+
+        renewed_service = None
+
+        if order.get("renewal_for_service"):
+            renewed_service = conn.execute(
+                "SELECT * FROM active_services WHERE id=?",
+                (order["renewal_for_service"],)
+            ).fetchone()
+
+    buyer = _akhavan_user_label(order)
+
+    lines = [
+        f"📅 <b>تاریخ سفارش #{order['id']}</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        "",
+        f"🛍 محصول: <b>{esc(order['product_title'])}</b>",
+        "📌 وضعیت: "
+        f"{ORDER_DATES_STATUS_LABELS.get(order['status'], esc(order['status']))}",
+        f"👤 خریدار: {esc(buyer)}",
+    ]
+
+    if order.get("gmail_address"):
+        lines.append(
+            f"📧 جیمیل: <code>{esc(order['gmail_address'])}</code>"
+        )
+
+    if order.get("renewal_for_service"):
+        lines.append(
+            f"🔄 این سفارش تمدید سرویس #{order['renewal_for_service']} است."
+        )
+
+    lines.append(f"💰 مبلغ: {money(order['price'])}")
+    lines.append("")
+    lines.append(
+        f"📝 ثبت سفارش: <b>{jalali_datetime_str(order['created_at'])}</b>"
+    )
+
+    if order.get("completed_at"):
+        lines.append(
+            f"📦 تحویل سفارش: <b>{jalali_datetime_str(order['completed_at'])}</b>"
+        )
+
+    lines.append("")
+
+    if order["status"] != "completed":
+        if order["status"] in ("rejected", "cancelled"):
+            lines.append(
+                "⛔️ این سفارش تحویل نشده است، پس بازه‌ی یک‌ماهه‌ای شروع نشده."
+            )
+        else:
+            lines.append(
+                "⏳ این سفارش هنوز تحویل نشده؛ بازه‌ی یک‌ماهه از لحظه‌ی تحویل شروع می‌شود."
+            )
+
+        return "\n".join(lines)
+
+    service = renewed_service or own_service
+
+    if not service:
+        lines.append(
+            "ℹ️ برای این سفارش سرویس زمان‌دار ثبت نشده است."
+        )
+        return "\n".join(lines)
+
+    superseded_by = service["renewal_order_id"]
+
+    if renewed_service:
+        is_current = (
+            superseded_by is not None
+            and int(superseded_by) == int(order_id)
+        )
+        start_raw = order.get("completed_at") or order.get("updated_at")
+    else:
+        is_current = superseded_by is None
+        start_raw = service["started_at"]
+
+    lines.append("⏱ <b>بازه‌ی زمانی سرویس</b>")
+
+    if is_current:
+        lines += _order_dates_period_lines(
+            start_raw,
+            service["expires_at"],
+            now_dt
+        )
+    else:
+        if superseded_by is not None and int(superseded_by) != int(order_id):
+            lines.append(
+                f"🔄 سرویس این سفارش بعداً با سفارش #{superseded_by} تمدید شده است. "
+                "وضعیت فعلی سرویس:"
+            )
+
+        lines += _order_dates_period_lines(
+            None,
+            service["expires_at"],
+            now_dt
+        )
+
+    return "\n".join(lines)
+
+
+def order_dates_result_keyboard():
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔎 جستجوی سفارش دیگر",
+            callback_data="admin:order_dates"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:order_dates"
+)
+def cb_admin_order_dates(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "order_dates_lookup",
+        {}
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    edit_or_send(
+        call,
+        "📅 <b>تاریخ سفارشات</b>\n\n"
+        "شماره‌ی سفارش را بفرستید (فقط عدد، مثلاً <code>20</code>).\n"
+        "تاریخ شمسی ثبت و تحویل سفارش و زمان باقی‌مانده‌ی بازه‌ی یک‌ماهه نمایش داده می‌شود.\n\n"
+        "برای لغو /cancel بفرستید.",
+        kb
+    )
+
+
+def handle_order_dates_message(message):
+    admin_id = message.from_user.id
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "❌ فقط شماره‌ی سفارش (عدد) را به‌صورت متن بفرستید یا /cancel بزنید."
+        )
+        return
+
+    order_id = parse_order_number(message.text)
+
+    if order_id is None:
+        bot.send_message(
+            message.chat.id,
+            "❌ شماره‌ی سفارش نامعتبر است. فقط عدد بفرستید (مثلاً 20) یا /cancel بزنید."
+        )
+        return
+
+    report = order_dates_report(order_id)
+
+    if report is None:
+        bot.send_message(
+            message.chat.id,
+            f"❌ سفارشی با شماره‌ی #{order_id} پیدا نشد. "
+            "شماره‌ی دیگری بفرستید یا /cancel بزنید."
+        )
+        return
+
+    clear_admin_state(admin_id)
+
+    bot.send_message(
+        message.chat.id,
+        report,
+        reply_markup=order_dates_result_keyboard()
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ADMIN TOOLS: 🔎 پروفایل کاربر / ⏳ سرویس‌های رو به انقضا /
+#              🧾 سفارش‌های در انتظار اقدام / 📈 گزارش فروش
+# ══════════════════════════════════════════════════════════════════════════════
+
+ADMIN_TOOLS_LIST_LIMIT = 12
+PENDING_ORDER_STATUSES = (
+    "receipt_submitted",
+    "paid_pending_fulfillment",
+    "fulfilling",
+)
+SALES_PERIODS = {
+    "today": ("امروز", 0),
+    "7": ("۷ روز اخیر", 6),
+    "30": ("۳۰ روز اخیر", 29),
+}
+
+
+def jalali_date_from_dt(dt_utc):
+    """datetime (UTC) → «۱۴۰۵/۰۷/۲۷» به وقت ایران."""
+
+    local = dt_utc.astimezone(timezone.utc) + IRAN_UTC_OFFSET
+
+    jy, jm, jd = gregorian_to_jalali(
+        local.year,
+        local.month,
+        local.day
+    )
+
+    return f"{jy:04d}/{jm:02d}/{jd:02d}"
+
+
+def iran_day_start_utc(now_dt, days_back=0):
+    """شروع (۰۰:۰۰ به وقت ایران) روزِ امروز یا days_back روز قبل، به UTC."""
+
+    local = now_dt.astimezone(timezone.utc) + IRAN_UTC_OFFSET
+
+    midnight = local.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    ) - timedelta(days=days_back)
+
+    return midnight - IRAN_UTC_OFFSET
+
+
+def service_remaining_label(expires_raw, now_dt):
+    end_dt = _order_dates_parse(expires_raw)
+
+    if end_dt is None:
+        return "♾ بدون انقضا"
+
+    if end_dt <= now_dt:
+        return f"❌ منقضی ({format_span_fa(now_dt - end_dt)} پیش)"
+
+    return f"✅ {format_span_fa(end_dt - now_dt)} مانده"
+
+
+def admin_tool_keyboard(refresh_callback=None):
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    if refresh_callback:
+        kb.add(
+            types.InlineKeyboardButton(
+                "🔄 بروزرسانی",
+                callback_data=refresh_callback
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+def _admin_tool_view(call, text, keyboard):
+    """نمایش یک گزارش فقط‌خواندنی؛ هر حالت در انتظار ورودی ادمین پاک می‌شود."""
+
+    clear_admin_state(
+        call.from_user.id
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    edit_or_send(
+        call,
+        text,
+        keyboard
+    )
+
+
+# ── 🔎 پروفایل کاربر ─────────────────────────────────────────────────────────
+
+def resolve_admin_target_user(text):
+    """شناسه عددی یا @یوزرنیم → ردیف کاربر (یا None)."""
+
+    raw = str(text or "").strip().translate(_ORDER_NUMBER_DIGITS)
+
+    if not raw:
+        return None
+
+    with db() as conn:
+        if re.fullmatch(r"\d{1,18}", raw):
+            return conn.execute(
+                "SELECT * FROM users WHERE user_id=?",
+                (int(raw),)
+            ).fetchone()
+
+        name = raw.lstrip("@")
+
+        if re.fullmatch(r"[A-Za-z0-9_]{3,64}", name):
+            return conn.execute(
+                """
+                SELECT *
+                FROM users
+                WHERE lower(username)=lower(?)
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (name,)
+            ).fetchone()
+
+    return None
+
+
+def admin_user_profile(user_id, now_dt=None):
+    """(متن، لیست شماره‌ی آخرین سفارش‌ها) یا None اگر کاربر نبود."""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    with db() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
+        if not user:
+            return None
+
+        user = dict(user)
+
+        status_rows = conn.execute(
+            """
+            SELECT status,
+                   COUNT(*) AS c,
+                   COALESCE(SUM(price), 0) AS s
+            FROM orders
+            WHERE user_id=?
+            GROUP BY status
+            """,
+            (user_id,)
+        ).fetchall()
+
+        recent = conn.execute(
+            """
+            SELECT *
+            FROM orders
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT 5
+            """,
+            (user_id,)
+        ).fetchall()
+
+        services = conn.execute(
+            """
+            SELECT *
+            FROM active_services
+            WHERE user_id=?
+            ORDER BY started_at DESC
+            LIMIT 5
+            """,
+            (user_id,)
+        ).fetchall()
+
+        services_total = conn.execute(
+            "SELECT COUNT(*) FROM active_services WHERE user_id=?",
+            (user_id,)
+        ).fetchone()[0]
+
+    username = (
+        f"@{user['username']}"
+        if user["username"]
+        else "بدون یوزرنیم"
+    )
+
+    lines = [
+        "🔎 <b>پروفایل کاربر</b>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"👤 نام: <b>{esc(user['first_name'] or 'بدون نام')}</b>",
+        f"🔗 یوزرنیم: {esc(username)}",
+        f"🆔 شناسه: <code>{user['user_id']}</code>",
+        "📶 وضعیت: "
+        + ("🚫 بلاک" if user["is_blocked"] else "✅ فعال"),
+        f"📝 اولین ورود: {jalali_datetime_str(user['created_at'])}",
+        f"🕒 آخرین فعالیت: {jalali_datetime_str(user['updated_at'])}",
+        f"💰 موجودی: <b>{money(user['balance'])}</b>",
+    ]
+
+    reserved = get_reserved_total(user_id)
+
+    if reserved > 0:
+        lines.append(
+            f"🔒 رزروشده روی سفارش‌های باز: {money(reserved)}"
+        )
+
+    lines.append("━━━━━━━━━━━━━━━━━━")
+
+    total_orders = sum(int(r["c"]) for r in status_rows)
+    lines.append(f"🧾 کل سفارش‌ها: <b>{total_orders}</b>")
+
+    completed = next(
+        (r for r in status_rows if r["status"] == "completed"),
+        None
+    )
+
+    if completed:
+        lines.append(
+            f"✅ تکمیل‌شده: {int(completed['c'])} سفارش — "
+            f"جمع خرید: <b>{money(completed['s'])}</b>"
+        )
+
+    others = [
+        f"{ORDER_DATES_STATUS_LABELS.get(r['status'], r['status'])}: {int(r['c'])}"
+        for r in status_rows
+        if r["status"] != "completed"
+    ]
+
+    if others:
+        lines.append("📌 " + " | ".join(esc(o) for o in others))
+
+    if recent:
+        lines.append("")
+        lines.append("🛒 <b>آخرین سفارش‌ها</b>")
+
+        for order in recent:
+            lines.append(
+                f"#{order['id']} | "
+                f"{esc(faq_short_label(order['product_title'], 35))} | "
+                f"{ORDER_DATES_STATUS_LABELS.get(order['status'], esc(order['status']))}\n"
+                f"   📝 {jalali_datetime_str(order['created_at'])}"
+            )
+
+    if services:
+        lines.append("")
+        lines.append(
+            f"📦 <b>سرویس‌ها</b> ({services_total})"
+        )
+
+        for svc in services:
+            lines.append(
+                f"• #{svc['id']} (سفارش #{svc['order_id']}) "
+                f"{esc(faq_short_label(svc['product_title'], 30))}\n"
+                f"   ⏹ {jalali_datetime_str(svc['expires_at']) if svc['expires_at'] else '—'} "
+                f"— {service_remaining_label(svc['expires_at'], now_dt)}"
+            )
+
+    return "\n".join(lines), [int(o["id"]) for o in recent]
+
+
+def admin_user_profile_keyboard(user_id, order_ids):
+    kb = types.InlineKeyboardMarkup(
+        row_width=3
+    )
+
+    if order_ids:
+        kb.add(
+            *[
+                types.InlineKeyboardButton(
+                    f"📅 #{order_id}",
+                    callback_data=f"admin:od:{order_id}"
+                )
+                for order_id in order_ids
+            ]
+        )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "👛 مدیریت موجودی",
+            callback_data=f"admin:uprof_wallet:{user_id}"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔁 کاربر دیگر",
+            callback_data="admin:user_profile"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:user_profile"
+)
+def cb_admin_user_profile(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "user_profile_lookup",
+        {}
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    edit_or_send(
+        call,
+        "🔎 <b>پروفایل کاربر</b>\n\n"
+        "شناسه‌ی عددی یا @یوزرنیم کاربر را بفرستید.\n"
+        "موجودی، سفارش‌ها (با تاریخ شمسی) و سرویس‌های او با زمان باقی‌مانده نمایش داده می‌شود.\n\n"
+        "برای لغو /cancel بفرستید.",
+        admin_tool_keyboard()
+    )
+
+
+def handle_user_profile_message(message):
+    admin_id = message.from_user.id
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "❌ شناسه‌ی عددی یا @یوزرنیم را به‌صورت متن بفرستید یا /cancel بزنید."
+        )
+        return
+
+    user = resolve_admin_target_user(message.text)
+
+    if not user:
+        bot.send_message(
+            message.chat.id,
+            "❌ کاربری با این مشخصات در دیتابیس ربات پیدا نشد.\n"
+            "کاربر باید حداقل یک‌بار ربات را استارت کرده باشد. "
+            "شناسه یا یوزرنیم دیگری بفرستید یا /cancel بزنید."
+        )
+        return
+
+    text, order_ids = admin_user_profile(user["user_id"])
+
+    clear_admin_state(admin_id)
+
+    bot.send_message(
+        message.chat.id,
+        text,
+        reply_markup=admin_user_profile_keyboard(
+            user["user_id"],
+            order_ids
+        )
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:uprof_wallet:")
+)
+def cb_admin_profile_wallet(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        target_id = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "نامعتبر.", show_alert=True)
+        return
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    show_admin_wallet_panel(
+        call.from_user.id,
+        target_id
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:od:")
+)
+def cb_admin_order_dates_shortcut(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    try:
+        order_id = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        bot.answer_callback_query(call.id, "نامعتبر.", show_alert=True)
+        return
+
+    report = order_dates_report(order_id)
+
+    if report is None:
+        bot.answer_callback_query(
+            call.id,
+            "این سفارش پیدا نشد.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    bot.send_message(
+        call.from_user.id,
+        report,
+        reply_markup=order_dates_result_keyboard()
+    )
+
+
+# ── ⏳ سرویس‌های رو به انقضا ─────────────────────────────────────────────────
+
+def admin_expiring_text(now_dt=None, window_days=7):
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    now_iso = now_dt.isoformat(timespec="seconds")
+    future_iso = (
+        now_dt + timedelta(days=window_days)
+    ).isoformat(timespec="seconds")
+    past_iso = (
+        now_dt - timedelta(days=window_days)
+    ).isoformat(timespec="seconds")
+
+    base_query = """
+        SELECT s.*,
+               u.username AS username,
+               u.first_name AS first_name
+        FROM active_services s
+        LEFT JOIN users u ON u.user_id = s.user_id
+        WHERE s.expires_at IS NOT NULL
+        AND s.expires_at {cond}
+        ORDER BY s.expires_at {order}
+    """
+
+    with db() as conn:
+        upcoming = conn.execute(
+            base_query.format(
+                cond="> ? AND s.expires_at <= ?",
+                order="ASC"
+            ),
+            (now_iso, future_iso)
+        ).fetchall()
+
+        expired = conn.execute(
+            base_query.format(
+                cond="<= ? AND s.expires_at >= ?",
+                order="DESC"
+            ),
+            (now_iso, past_iso)
+        ).fetchall()
+
+    def render(title, rows):
+        out = [title]
+
+        if not rows:
+            out.append("— موردی نیست —")
+            return out
+
+        for svc in rows[:ADMIN_TOOLS_LIST_LIMIT]:
+            out.append(
+                f"• #{svc['id']} (سفارش #{svc['order_id']}) "
+                f"{esc(faq_short_label(svc['product_title'], 30))}\n"
+                f"   👤 {esc(_akhavan_user_label(svc))}\n"
+                f"   ⏹ {jalali_datetime_str(svc['expires_at'])} "
+                f"— {service_remaining_label(svc['expires_at'], now_dt)}"
+            )
+
+        if len(rows) > ADMIN_TOOLS_LIST_LIMIT:
+            out.append(
+                f"… و {len(rows) - ADMIN_TOOLS_LIST_LIMIT} مورد دیگر"
+            )
+
+        return out
+
+    lines = [
+        "⏳ <b>سرویس‌های رو به انقضا</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_iso)}",
+        "",
+    ]
+
+    lines += render(
+        f"⏰ <b>انقضا در {window_days} روز آینده</b> ({len(upcoming)})",
+        upcoming
+    )
+    lines.append("")
+    lines += render(
+        f"🔴 <b>منقضی‌شده در {window_days} روز اخیر</b> ({len(expired)})",
+        expired
+    )
+
+    return "\n".join(lines)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:expiring"
+)
+def cb_admin_expiring(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    _admin_tool_view(
+        call,
+        admin_expiring_text(),
+        admin_tool_keyboard("admin:expiring")
+    )
+
+
+# ── 🧾 سفارش‌های در انتظار اقدام ─────────────────────────────────────────────
+
+def admin_pending_orders_text(now_dt=None):
+    """(متن، لیست شماره سفارش‌های نمایش‌داده‌شده)"""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    placeholders = ",".join("?" for _ in PENDING_ORDER_STATUSES)
+
+    with db() as conn:
+        total = conn.execute(
+            f"SELECT COUNT(*) FROM orders WHERE status IN ({placeholders})",
+            PENDING_ORDER_STATUSES
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            f"""
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE o.status IN ({placeholders})
+            ORDER BY o.created_at ASC
+            LIMIT ?
+            """,
+            (*PENDING_ORDER_STATUSES, ADMIN_TOOLS_LIST_LIMIT)
+        ).fetchall()
+
+    lines = [
+        "🧾 <b>سفارش‌های در انتظار اقدام</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        "(فیش‌های منتظر بررسی، سفارش‌های آماده‌ی تحویل و در حال تحویل؛ قدیمی‌ترین اول)",
+        "",
+        f"تعداد کل: <b>{total}</b>",
+    ]
+
+    if not rows:
+        lines.append("\n✅ همه‌ی سفارش‌ها رسیدگی شده‌اند.")
+        return "\n".join(lines), []
+
+    lines.append("")
+
+    for order in rows:
+        created = _order_dates_parse(order["created_at"])
+        waited = (
+            format_span_fa(now_dt - created)
+            if created and now_dt > created
+            else "—"
+        )
+
+        entry = (
+            f"#{order['id']} | "
+            f"{esc(faq_short_label(order['product_title'], 30))} | "
+            f"{ORDER_DATES_STATUS_LABELS.get(order['status'], esc(order['status']))}\n"
+            f"   👤 {esc(_akhavan_user_label(order))}\n"
+            f"   📝 {jalali_datetime_str(order['created_at'])} — ⏱ {waited} انتظار"
+        )
+
+        if order["status"] == "fulfilling" and order["assigned_admin_id"]:
+            entry += f"\n   👨‍💼 ادمین: <code>{order['assigned_admin_id']}</code>"
+
+        lines.append(entry)
+
+    if total > len(rows):
+        lines.append(f"… و {total - len(rows)} سفارش دیگر")
+
+    return "\n".join(lines), [int(o["id"]) for o in rows]
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:pending_orders"
+)
+def cb_admin_pending_orders(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    text, order_ids = admin_pending_orders_text()
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=4
+    )
+
+    if order_ids:
+        kb.add(
+            *[
+                types.InlineKeyboardButton(
+                    f"📅 #{order_id}",
+                    callback_data=f"admin:od:{order_id}"
+                )
+                for order_id in order_ids
+            ]
+        )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔄 بروزرسانی",
+            callback_data="admin:pending_orders"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    _admin_tool_view(call, text, kb)
+
+
+# ── 📈 گزارش فروش ────────────────────────────────────────────────────────────
+
+def admin_sales_report(period="today", now_dt=None):
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    if period not in SALES_PERIODS:
+        period = "today"
+
+    label, days_back = SALES_PERIODS[period]
+    start_dt = iran_day_start_utc(now_dt, days_back)
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT product_id, product_title, price, completed_at
+            FROM orders
+            WHERE status='completed'
+            AND completed_at >= ?
+            """,
+            (start_dt.isoformat(timespec="seconds"),)
+        ).fetchall()
+
+    count = len(rows)
+    revenue = sum(int(r["price"]) for r in rows)
+
+    by_product = {}
+    by_day = {}
+
+    for row in rows:
+        key = (row["product_id"], row["product_title"])
+        entry = by_product.setdefault(key, [0, 0])
+        entry[0] += 1
+        entry[1] += int(row["price"])
+
+        done = _order_dates_parse(row["completed_at"])
+
+        if done:
+            day = jalali_date_from_dt(done)
+            day_entry = by_day.setdefault(day, [0, 0])
+            day_entry[0] += 1
+            day_entry[1] += int(row["price"])
+
+    lines = [
+        f"📈 <b>گزارش فروش — {label}</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        f"از {jalali_date_from_dt(start_dt)} (به وقت ایران)",
+        "",
+        f"🧾 سفارش‌های تکمیل‌شده: <b>{count}</b>",
+        f"💰 جمع فروش: <b>{money(revenue)}</b>",
+    ]
+
+    if count:
+        lines.append(
+            f"📊 میانگین هر سفارش: {money(revenue // count)}"
+        )
+
+        lines.append("")
+        lines.append("🏆 <b>به تفکیک محصول</b>")
+
+        ranked = sorted(
+            by_product.items(),
+            key=lambda item: (-item[1][0], -item[1][1])
+        )
+
+        for index, ((_pid, title), (c, s)) in enumerate(ranked[:8], start=1):
+            lines.append(
+                f"{index}. {esc(faq_short_label(title, 35))} — "
+                f"{c} سفارش — {money(s)}"
+            )
+
+        if period != "today":
+            lines.append("")
+            lines.append("📆 <b>به تفکیک روز</b>")
+
+            for day in sorted(by_day, reverse=True):
+                c, s = by_day[day]
+                lines.append(f"{day}: {c} سفارش — {money(s)}")
+
+    else:
+        lines.append("\nدر این بازه سفارشی تکمیل نشده است.")
+
+    return "\n".join(lines)
+
+
+def admin_sales_keyboard(period):
+    kb = types.InlineKeyboardMarkup(
+        row_width=3
+    )
+
+    kb.add(
+        *[
+            types.InlineKeyboardButton(
+                ("✅ " if key == period else "") + label,
+                callback_data=f"admin:sales:{key}"
+            )
+            for key, (label, _days) in SALES_PERIODS.items()
+        ]
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:sales"
+    or c.data.startswith("admin:sales:")
+)
+def cb_admin_sales(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    parts = call.data.split(":")
+    period = parts[2] if len(parts) > 2 else "today"
+
+    if period not in SALES_PERIODS:
+        period = "today"
+
+    _admin_tool_view(
+        call,
+        admin_sales_report(period),
+        admin_sales_keyboard(period)
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN STATE MESSAGE HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -15148,6 +16287,22 @@ def admin_state_message(message):
         handle_faq_add_answer_message(
             message,
             state
+        )
+
+        return
+
+    if mode == "order_dates_lookup":
+
+        handle_order_dates_message(
+            message
+        )
+
+        return
+
+    if mode == "user_profile_lookup":
+
+        handle_user_profile_message(
+            message
         )
 
         return
