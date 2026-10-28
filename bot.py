@@ -184,7 +184,7 @@ EYLAN_REQUIRED_NODE_NAMES = [
     item.strip()
     for item in os.getenv(
         "EYLAN_REQUIRED_NODE_NAMES",
-        "Germany-4,Germany-2,Turkey-1,Turkey-3"
+        "Germany-3,Germany-4,Germany-2,Turkey-1,Turkey-3,Turkey-2,Turkey-4"
     ).split(",")
     if item.strip()
 ]

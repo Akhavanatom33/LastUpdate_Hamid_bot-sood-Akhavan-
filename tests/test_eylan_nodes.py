@@ -43,10 +43,30 @@ class EylanNodeNameTests(unittest.TestCase):
                 self.assertEqual(len(ids), len(set(ids)))
                 self.assertGreater(len(ids), 0)
 
+    def test_plans_do_not_override_node_list(self):
+        # منبع واحد نام Nodeها = EYLAN_REQUIRED_NODE_NAMES؛ اگر کسی دوباره
+        # لیست داخل پلن بگذارد، عوض‌کردن متغیر محیطی اثری نخواهد داشت.
+        for product_id, plan in bot.EYLAN_PLANS.items():
+            with self.subTest(product=product_id):
+                self.assertNotIn("required_node_names", plan)
+
+    def test_env_variable_controls_all_plans(self):
+        client = FakeClient(VISIBLE_NODES)
+        original = bot.EYLAN_REQUIRED_NODE_NAMES
+        bot.EYLAN_REQUIRED_NODE_NAMES = ["Turkey-2", "Germany-3"]
+        try:
+            payload = bot.eylan_payload_for_product(
+                "wireguard-50gb-1m", "some_user", client=client
+            )
+        finally:
+            bot.EYLAN_REQUIRED_NODE_NAMES = original
+        self.assertEqual(payload["nodes"], [12, 3])
+
     def test_default_env_names_resolve(self):
         client = FakeClient(VISIBLE_NODES)
         ids = bot._resolve_required_node_ids(client, {})
-        self.assertEqual(ids, [4, 2, 11, 13])  # Germany-4, Germany-2, Turkey-1, Turkey-3
+        # ترتیب لیست پیش‌فرض: Germany-3, Germany-4, Germany-2, Turkey-1, Turkey-3, Turkey-2, Turkey-4
+        self.assertEqual(ids, [3, 4, 2, 11, 13, 12, 14])
 
     def test_old_name_fails_with_clear_message(self):
         client = FakeClient(VISIBLE_NODES)
@@ -63,7 +83,7 @@ class EylanNodeNameTests(unittest.TestCase):
         payload = bot.eylan_payload_for_product(
             bot.TRIAL_PRODUCT_ID, "trial_user", client=client
         )
-        self.assertEqual(payload["nodes"], [4, 2, 11, 13])
+        self.assertEqual(payload["nodes"], [3, 4, 2, 11, 13, 12, 14])
         self.assertTrue(payload["enable_wg1"])
 
 

@@ -7,13 +7,7 @@
     "expiry_days": 30,
     "enable_wg1": true,
     "enable_openvpn": false,
-    "service": "wireguard",
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "service": "wireguard"
   },
   "wireguard-100gb-1m": {
     "data_limit": 100,
@@ -23,13 +17,7 @@
     "expiry_days": 30,
     "enable_wg1": true,
     "enable_openvpn": false,
-    "service": "wireguard",
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "service": "wireguard"
   },
   "wireguard-200gb-1m": {
     "data_limit": 200,
@@ -39,13 +27,7 @@
     "expiry_days": 30,
     "enable_wg1": true,
     "enable_openvpn": false,
-    "service": "wireguard",
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "service": "wireguard"
   },
   "wireguard-trial": {
     "data_limit": 0,
@@ -56,13 +38,7 @@
     "pending_activation_days": 2,
     "enable_wg1": true,
     "enable_openvpn": false,
-    "service": "wireguard",
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "service": "wireguard"
   },
   "v2ray-15gb": {
     "service": "v2ray",
@@ -72,13 +48,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-20gb": {
     "service": "v2ray",
@@ -88,13 +58,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-25gb": {
     "service": "v2ray",
@@ -104,13 +68,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-30gb": {
     "service": "v2ray",
@@ -120,13 +78,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-35gb": {
     "service": "v2ray",
@@ -136,13 +88,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-40gb": {
     "service": "v2ray",
@@ -152,13 +98,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-45gb": {
     "service": "v2ray",
@@ -168,13 +108,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-50gb": {
     "service": "v2ray",
@@ -184,13 +118,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-75gb": {
     "service": "v2ray",
@@ -200,13 +128,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-100gb": {
     "service": "v2ray",
@@ -216,13 +138,7 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   },
   "v2ray-200gb": {
     "service": "v2ray",
@@ -232,12 +148,6 @@
     "enable_wg1": false,
     "enable_openvpn": false,
     "enable_singbox": true,
-    "singbox_inbounds": [],
-    "required_node_names": [
-      "Germany-4",
-      "Germany-2",
-      "Turkey-1",
-      "Turkey-3"
-    ]
+    "singbox_inbounds": []
   }
 }
