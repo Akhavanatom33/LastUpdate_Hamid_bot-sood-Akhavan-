@@ -59,7 +59,8 @@ class EylanPanelClient:
 
         if not self.api_key:
             raise EylanPanelConfigurationError(
-                "EYLAN_API_KEY is missing. Set it in the server environment variables."
+                "EYLAN_API_KEY is missing. Set it in the server environment variables, "
+                "then restart/redeploy the bot so the new value is loaded."
             )
 
         if not self.base_urls:

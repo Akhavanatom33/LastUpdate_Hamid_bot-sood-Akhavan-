@@ -188,6 +188,42 @@ EYLAN_REQUIRED_NODE_NAMES = [
     ).split(",")
     if item.strip()
 ]
+
+
+def parse_wg_interfaces(value):
+    """«wg1, wg2 ,wg3» → ['wg1', 'wg2', 'wg3']؛ نام نامعتبر نادیده گرفته می‌شود."""
+
+    names = []
+
+    for raw in (value or "").split(","):
+        name = raw.strip().lower()
+
+        if re.fullmatch(r"wg[1-9][0-9]?", name) and name not in names:
+            names.append(name)
+
+    return names or ["wg1"]
+
+
+# اینترفیس‌های WireGuard که روی کاربر پنل فعال می‌شوند (wg2 = Germany-3، wg3 = Turkey-4).
+# اگر پنل فیلدهای wg2/wg3 را نپذیرفت، فقط مقدار این متغیر را روی wg1 بگذارید.
+EYLAN_WG_INTERFACES = parse_wg_interfaces(
+    os.getenv("EYLAN_WG_INTERFACES", "wg1,wg2,wg3")
+)
+
+# فقط وضعیت تنظیمات را در لاگ استارت چاپ می‌کنیم (خود کلید هرگز چاپ نمی‌شود)
+# تا بعد از تغییر متغیرها در لاگ Deploy مشخص باشد ربات آن‌ها را دیده است یا نه.
+print(
+    "[boot] EylanPanel config: API key "
+    + (
+        f"SET ({len(EYLAN_API_KEY)} chars)"
+        if EYLAN_API_KEY
+        else "MISSING"
+    )
+    + f" | nodes={','.join(EYLAN_REQUIRED_NODE_NAMES)}"
+    + f" | wg={','.join(EYLAN_WG_INTERFACES)}",
+    flush=True
+)
+
 try:
     EYLAN_API_TIMEOUT = float(
         os.getenv("EYLAN_API_TIMEOUT", "20").strip() or "20"
@@ -4666,7 +4702,7 @@ def eylan_payload_for_product(
     }
 
     # The EylanPanel API supports a `nodes` array. For this shop we explicitly
-    # resolve and attach all four required nodes instead of relying on panel
+    # resolve and attach all the required nodes instead of relying on panel
     # defaults, so no customer silently receives a partial node set.
     api_client = client or get_eylan_client()
     payload["nodes"] = _resolve_required_node_ids(api_client, plan)
@@ -4677,6 +4713,14 @@ def eylan_payload_for_product(
             "enable_wg1": bool(plan.get("enable_wg1", True)),
             "enable_openvpn": bool(plan.get("enable_openvpn", False)),
         })
+
+        # wg2 / wg3 (Germany-3 و Turkey-4) هم باید روی کاربر فعال شوند، وگرنه
+        # پنل آن Nodeها را برای کاربر اضافه نمی‌کند.
+        for interface in EYLAN_WG_INTERFACES:
+            if interface != "wg1":
+                payload[f"enable_{interface}"] = bool(
+                    plan.get(f"enable_{interface}", True)
+                )
 
         data_limit = plan.get("data_limit")
         if product_id == TRIAL_PRODUCT_ID and EYLAN_TRIAL_DATA_LIMIT is not None:

@@ -32,6 +32,8 @@
 - Nodeهای اجباری حالا هفت‌تا هستند: `Germany-3`، `Germany-4`، `Germany-2`، `Turkey-1`، `Turkey-3`، `Turkey-2` و `Turkey-4`.
 - **منبع واحد نام Nodeها متغیر محیطی `EYLAN_REQUIRED_NODE_NAMES` است.** لیست `required_node_names` از داخل پلن‌های `eylan_plans.json` حذف شد (قبلاً لیست داخل پلن اولویت داشت و عوض‌کردن متغیر محیطی اثری نداشت). از این به بعد برای هر تغییر در Nodeها فقط همین متغیر را در هاست عوض کنید و ربات را ریستارت کنید؛ نیازی به آپدیت گیت‌هاب نیست. (اگر لازم شد برای یک پلن خاص لیست جدا بدهید، کلید `required_node_names` هنوز در همان پلن پشتیبانی می‌شود.)
 - مقدار پیش‌فرض داخل `bot.py` هم همین هفت Node است؛ اگر متغیر محیطی تنظیم نشده باشد از همان استفاده می‌شود.
+- **بعد از هر تغییر در متغیرهای محیطی، ربات را ریستارت/Redeploy کنید.** مقدارها فقط هنگام استارت خوانده می‌شوند. در لاگ استارت خطی مثل `[boot] EylanPanel config: API key SET (43 chars) | nodes=... | wg=...` چاپ می‌شود (خود کلید چاپ نمی‌شود)؛ اگر `MISSING` دیدید یعنی متغیر `EYLAN_API_KEY` به ربات نرسیده است.
+- **فعال‌سازی wg2 و wg3:** Germany-3 به `wg2` و Turkey-4 به `wg3` وصل است؛ تا این اینترفیس‌ها روی کاربر فعال نشوند پنل آن دو Node را اضافه نمی‌کند. ربات حالا هنگام ساخت و تمدید سرویس WireGuard (و اکانت تست) فیلدهای `enable_wg1`، `enable_wg2` و `enable_wg3` را می‌فرستد. این رفتار با متغیر `EYLAN_WG_INTERFACES` کنترل می‌شود (پیش‌فرض `wg1,wg2,wg3`؛ برای برگشت به قبل مقدار را `wg1` بگذارید). نام فیلدهای `enable_wg2/3` بر اساس الگوی `enable_wg1` است. تمدید سرویس‌های قدیمی هم این اینترفیس‌ها را برایشان فعال می‌کند.
 - تست `tests/test_eylan_nodes.py` فهرست Nodeهای فعلی پنل را با تنظیمات می‌سنجد تا اگر نامی عوض شود، قبل از Deploy خطا بدهد.
 
 ## 🆕 آپدیت: ابزارهای جدید پنل ادمین
@@ -186,6 +188,7 @@ EYLAN_ALLOW_HTTP=false                          # ⭐ جدید؛ فقط اگر �
 EYLAN_TRIAL_DATA_LIMIT=                         # ⭐ اختیاری؛ خالی=نامحدود، مثلاً 10=ده گیگ
 EYLAN_SINGBOX_INBOUNDS=                         # ⭐ جدید/اختیاری؛ مثلاً reality-main,ss-main
 EYLAN_REQUIRED_NODE_NAMES=Germany-3,Germany-4,Germany-2,Turkey-1,Turkey-3,Turkey-2,Turkey-4  # Nodeهای اجباری برای کاربران خودکار
+EYLAN_WG_INTERFACES=wg1,wg2,wg3  # اینترفیس‌های WireGuard فعال روی کاربر (wg2=Germany-3، wg3=Turkey-4)
 ```
 
 ### متغیرهای جدید این آپدیت
@@ -202,6 +205,7 @@ EYLAN_REQUIRED_NODE_NAMES=Germany-3,Germany-4,Germany-2,Turkey-1,Turkey-3,Turkey
 | `EYLAN_TRIAL_DATA_LIMIT` | اختیاری | حجم اکانت تست WireGuard بر حسب GB؛ خالی/`0` یعنی بدون محدودیت حجم |
 | `EYLAN_SINGBOX_INBOUNDS` | اختیاری | tagهای inbound برای V2Ray/Sing-box، جداشده با کاما؛ خالی باشد از API کشف می‌شوند |
 | `EYLAN_REQUIRED_NODE_NAMES` | اختیاری با مقدار پیش‌فرض هفت Node پروژه | نام نمایشی Nodeها، جداشده با کاما؛ ربات نام‌ها را از `GET /api/v1/nodes` به ID تبدیل می‌کند و همه‌ی Nodeهای لیست را در Create/Update می‌فرستد |
+| `EYLAN_WG_INTERFACES` | اختیاری، پیش‌فرض `wg1,wg2,wg3` | اینترفیس‌های WireGuard که هنگام ساخت/تمدید روی کاربر پنل فعال می‌شوند (`enable_wg1` و `enable_wg2` و `enable_wg3`). `wg2` مربوط به Germany-3 و `wg3` مربوط به Turkey-4 است. اگر پنل این فیلدها را نپذیرفت، مقدار را روی `wg1` بگذارید |
 
 **رمز ورود خود پنل EylanPanel (`username/password`) جزو متغیرهای این پروژه نیست.** چیزی که API لازم دارد `EYLAN_API_KEY` است.
 
