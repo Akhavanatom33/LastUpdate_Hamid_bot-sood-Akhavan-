@@ -455,6 +455,54 @@ USER_CONNECTION_SERVICES = {
 }
 
 
+# زیرمجموعه‌های آموزش وایرگارد. محتوای هر بخش جداگانه در connection_content
+# با همین کلیدها ذخیره می‌شود. محتوای قدیمی که زیر کلید «wireguard» ثبت شده
+# حذف نمی‌شود و (فقط اگر محتوایی داشته باشد) به‌عنوان «آموزش عمومی» نمایش
+# داده می‌شود.
+WIREGUARD_GUIDE_SECTIONS = {
+    "wireguard_mobile": "📱 آموزش اتصال در موبایل",
+    "wireguard_windows": "💻 آموزش اتصال در ویندوز",
+    "wireguard_tools": "📥 دانلود ابزار های مورد نیاز برای اتصال",
+}
+
+WIREGUARD_LEGACY_GUIDE_LABEL = "📚 آموزش عمومی وایرگارد"
+
+# «نحوه اتصال (تحویل)»: محتوایی (فایل + کپشن، متن و ...) که ادمین یک بار در
+# پنل مدیریت ثبت می‌کند و هنگام تحویل سفارش وایرساک / وایرگارد و V2Ray،
+# همزمان با پیام آماده برای مشتری ارسال می‌شود. محتوا با file_id ذخیره و با
+# کپی/ارسال مجدد فرستاده می‌شود؛ بنابراین هیچ‌جا مشخص نیست چه کسی آن را
+# فوروارد یا ارسال کرده است.
+DELIVERY_ATTACHMENT_SECTION = "delivery_attachment"
+DELIVERY_ATTACHMENT_LABEL = "📎 نحوه اتصال (تحویل)"
+DELIVERY_ATTACHMENT_SERVICES = ("wireguard", "v2ray")
+
+
+def guide_section_label(section):
+    """نام کامل یک بخش آموزشی (برای عنوان پیام‌ها)."""
+
+    if section == DELIVERY_ATTACHMENT_SECTION:
+        return DELIVERY_ATTACHMENT_LABEL
+
+    if section in WIREGUARD_GUIDE_SECTIONS:
+        return (
+            f"{SERVICE_LABELS['wireguard']} — "
+            f"{WIREGUARD_GUIDE_SECTIONS[section]}"
+        )
+
+    return SERVICE_LABELS.get(
+        section,
+        section
+    )
+
+
+def is_guide_section(section):
+    return (
+        section in SERVICE_LABELS
+        or section in WIREGUARD_GUIDE_SECTIONS
+        or section == DELIVERY_ATTACHMENT_SECTION
+    )
+
+
 # ── اکانت تست وایرساک ────────────────────────────────────────────────────────
 # اکانت تست حداکثر ۲ روز از لحظه ساخت فعال می‌ماند و از لحظه اولین اتصال
 # فقط ۱ روز فرصت تست وجود دارد.
@@ -5205,6 +5253,9 @@ def deliver_eylan_order_via_api(admin_id, order_id):
                 delivery_message_id=existing_message_id,
                 api_status="message_sent",
             )
+            # فایل/کپشن «نحوه اتصال (تحویل)» همزمان با پیام آماده؛ فقط یک بار
+            # (در تلاش مجدد بعد از خطا دوباره ارسال نمی‌شود).
+            send_delivery_attachments(order["user_id"], service)
 
         complete_order(order_id)
         save_order_api_state(
@@ -5688,6 +5739,11 @@ def deliver_order_payload(
                     reply_markup=reply_main_keyboard()
                 )
 
+                send_delivery_attachments(
+                    order["user_id"],
+                    service
+                )
+
                 register_service_or_renew(
                     service,
                     service == "wireguard"
@@ -5705,6 +5761,11 @@ def deliver_order_payload(
                     order["user_id"],
                     message.chat.id,
                     message.message_id
+                )
+
+                send_delivery_attachments(
+                    order["user_id"],
+                    service
                 )
 
                 register_service_or_renew(
@@ -5739,6 +5800,11 @@ def deliver_order_payload(
                 order["user_id"],
                 message.chat.id,
                 message.message_id
+            )
+
+            send_delivery_attachments(
+                order["user_id"],
+                service
             )
 
             register_service_or_renew(
@@ -6737,6 +6803,14 @@ def admin_guide_keyboard():
 
     kb.add(
         types.InlineKeyboardButton(
+            f"{DELIVERY_ATTACHMENT_LABEL} "
+            f"({connection_admin_content_count(DELIVERY_ATTACHMENT_SECTION)})",
+            callback_data=f"guide:section:{DELIVERY_ATTACHMENT_SECTION}"
+        )
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
             "⬅️ بازگشت به پنل",
             callback_data="admin:home"
         )
@@ -6750,12 +6824,15 @@ def admin_guide_service_keyboard(service):
         row_width=1
     )
 
-    kb.add(
-        types.InlineKeyboardButton(
-            "➕ افزودن محتوا",
-            callback_data=f"guide:add:{service}"
+    # محتوای جدید وایرگارد در زیربخش‌ها (موبایل/ویندوز/ابزارها) ثبت می‌شود؛
+    # بخش قدیمی «wireguard» فقط برای مدیریت/حذف محتوای قبلی باقی مانده است.
+    if service != "wireguard":
+        kb.add(
+            types.InlineKeyboardButton(
+                "➕ افزودن محتوا",
+                callback_data=f"guide:add:{service}"
+            )
         )
-    )
 
     kb.add(
         types.InlineKeyboardButton(
@@ -6773,15 +6850,31 @@ def admin_guide_service_keyboard(service):
 
     kb.add(
         types.InlineKeyboardButton(
-            "🗑 حذف همه محتوا",
-            callback_data=f"guide:clear:{service}"
+            "🗑 حذف یک یا چند مورد",
+            callback_data=f"gdel:o:{service}"
         )
     )
 
     kb.add(
         types.InlineKeyboardButton(
+            "🗑 حذف همه محتوا",
+            callback_data=f"guide:clear:{service}"
+        )
+    )
+
+    back_target = (
+        "guide:service:wireguard"
+        if (
+            service in WIREGUARD_GUIDE_SECTIONS
+            or service == "wireguard"
+        )
+        else "admin:guides"
+    )
+
+    kb.add(
+        types.InlineKeyboardButton(
             "⬅️ بازگشت",
-            callback_data="admin:guides"
+            callback_data=back_target
         )
     )
 
@@ -7112,14 +7205,20 @@ def store_connection_content(
 
         file_id = message.sticker.file_id
 
-    sort_order = (
-        connection_admin_content_count(
-            service
-        )
-        + 1
-    )
-
     with db() as conn:
+        # بعد از «حذف یک یا چند مورد» ممکن است شماره‌ها پشت‌سرهم نباشند؛
+        # پس محتوای جدید همیشه بعد از آخرین مورد قرار می‌گیرد.
+        sort_order = int(
+            conn.execute(
+                """
+                SELECT COALESCE(MAX(sort_order), 0)
+                FROM connection_content
+                WHERE service=?
+                """,
+                (service,)
+            ).fetchone()[0]
+        ) + 1
+
         conn.execute(
             """
             INSERT INTO connection_content(
@@ -7146,8 +7245,8 @@ def store_connection_content(
 
     bot.send_message(
         admin_id,
-        f"✅ محتوای شماره {sort_order} برای "
-        f"{SERVICE_LABELS[service]} ذخیره شد.\n"
+        f"✅ محتوای شماره {connection_admin_content_count(service)} برای "
+        f"{guide_section_label(service)} ذخیره شد.\n"
         "محتوای بعدی را بفرستید یا «اتمام افزودن» را بزنید.",
         reply_markup=guide_upload_keyboard()
     )
@@ -7183,8 +7282,7 @@ def send_connection_content(
             (service,)
         ).fetchall()
 
-    label = SERVICE_LABELS.get(
-        service,
+    label = guide_section_label(
         service
     )
 
@@ -7309,7 +7407,7 @@ def preview_connection_content(
 
     bot.send_message(
         admin_id,
-        f"👁 <b>پیش‌نمایش آموزش {SERVICE_LABELS[service]}</b>"
+        f"👁 <b>پیش‌نمایش آموزش {guide_section_label(service)}</b>"
     )
 
     for row in rows:
@@ -7389,6 +7487,91 @@ def preview_connection_content(
             )
 
 
+def send_delivery_attachments(
+    user_id,
+    service=None
+):
+    """
+    محتوای «نحوه اتصال (تحویل)» را بلافاصله بعد از پیام تحویل برای مشتری
+    می‌فرستد (فقط برای سرویس‌های وایرساک / وایرگارد و V2Ray).
+
+    از file_id و کپشن ذخیره‌شده استفاده می‌شود، نه فوروارد؛ پس نام ادمین یا
+    مبدا پیام برای مشتری نمایش داده نمی‌شود. خطاهای این مرحله هرگز تحویل
+    اصلی سفارش را خراب نمی‌کنند.
+    """
+
+    if (
+        service is not None
+        and service not in DELIVERY_ATTACHMENT_SERVICES
+    ):
+        return 0
+
+    try:
+        rows = get_connection_content_rows(
+            DELIVERY_ATTACHMENT_SECTION
+        )
+    except Exception:
+        logger.exception(
+            "Failed loading delivery attachments"
+        )
+        return 0
+
+    sent = 0
+
+    senders = {
+        "photo": bot.send_photo,
+        "video": bot.send_video,
+        "document": bot.send_document,
+        "audio": bot.send_audio,
+        "voice": bot.send_voice,
+        "animation": bot.send_animation,
+    }
+
+    for row in rows:
+
+        try:
+
+            ctype = row["content_type"]
+
+            if ctype == "text":
+
+                bot.send_message(
+                    user_id,
+                    row["text_content"] or "",
+                    parse_mode=None
+                )
+
+            elif ctype == "sticker":
+
+                bot.send_sticker(
+                    user_id,
+                    row["file_id"]
+                )
+
+            elif ctype in senders:
+
+                senders[ctype](
+                    user_id,
+                    row["file_id"],
+                    caption=row["caption"] or None
+                )
+
+            else:
+                continue
+
+            sent += 1
+
+        except Exception:
+
+            logger.exception(
+                "Failed sending delivery attachment id=%s to user=%s",
+                row["id"],
+                user_id
+            )
+
+    return sent
+
+
 def clear_connection_content(
     service
 ):
@@ -7400,6 +7583,309 @@ def clear_connection_content(
             """,
             (service,)
         )
+
+
+# ── زیرمنوی آموزش وایرگارد ───────────────────────────────────────────────────
+
+WIREGUARD_CONNECTION_MENU_TEXT = (
+    f"🔗 <b>آموزش {SERVICE_LABELS['wireguard']}</b>\n\n"
+    "بخش موردنظر خود را انتخاب کنید:"
+)
+
+
+def wireguard_guide_has_content():
+    """آیا حداقل یکی از بخش‌های آموزش وایرگارد محتوا دارد؟"""
+
+    return any(
+        connection_admin_content_count(section) > 0
+        for section in (
+            list(WIREGUARD_GUIDE_SECTIONS)
+            + ["wireguard"]
+        )
+    )
+
+
+def wireguard_connection_menu_keyboard():
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    for section, label in WIREGUARD_GUIDE_SECTIONS.items():
+        kb.add(
+            types.InlineKeyboardButton(
+                label,
+                callback_data=f"connection_section:{section}"
+            )
+        )
+
+    if connection_admin_content_count("wireguard") > 0:
+        kb.add(
+            types.InlineKeyboardButton(
+                WIREGUARD_LEGACY_GUIDE_LABEL,
+                callback_data="connection_section:wireguard"
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data="connection_menu"
+        )
+    )
+
+    return kb
+
+
+def admin_guide_wireguard_keyboard():
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    for section, label in WIREGUARD_GUIDE_SECTIONS.items():
+        count = connection_admin_content_count(
+            section
+        )
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{label} ({count})",
+                callback_data=f"guide:section:{section}"
+            )
+        )
+
+    legacy_count = connection_admin_content_count(
+        "wireguard"
+    )
+
+    if legacy_count > 0:
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{WIREGUARD_LEGACY_GUIDE_LABEL} ({legacy_count})",
+                callback_data="guide:section:wireguard"
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data="admin:guides"
+        )
+    )
+
+    return kb
+
+
+# ── 🗑 حذف یک یا چند مورد ─────────────────────────────────────────────────────
+
+GUIDE_DELETE_PAGE_SIZE = 8
+
+GUIDE_CONTENT_TYPE_LABELS = {
+    "text": "📝 متن",
+    "photo": "🖼 عکس",
+    "video": "🎬 ویدئو",
+    "document": "📄 فایل",
+    "audio": "🎵 صوت",
+    "voice": "🎤 ویس",
+    "animation": "🎞 گیف",
+    "sticker": "🔖 استیکر",
+}
+
+# موارد انتخاب‌شده هر ادمین برای هر بخش: {(admin_id, section): set(ids)}
+GUIDE_DELETE_SELECTIONS = {}
+GUIDE_DELETE_LOCK = threading.Lock()
+
+
+def get_connection_content_rows(section):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM connection_content
+            WHERE service=?
+            ORDER BY sort_order, id
+            """,
+            (section,)
+        ).fetchall()
+
+
+def delete_connection_content_items(section, item_ids):
+    """موارد انتخاب‌شده را حذف و ترتیب بقیه را دوباره شماره‌گذاری می‌کند."""
+
+    ids = [int(i) for i in item_ids]
+
+    if not ids:
+        return 0
+
+    placeholders = ",".join("?" for _ in ids)
+
+    with db() as conn:
+        cursor = conn.execute(
+            f"""
+            DELETE FROM connection_content
+            WHERE service=?
+            AND id IN ({placeholders})
+            """,
+            [section] + ids
+        )
+
+        deleted = cursor.rowcount
+
+        remaining = conn.execute(
+            """
+            SELECT id
+            FROM connection_content
+            WHERE service=?
+            ORDER BY sort_order, id
+            """,
+            (section,)
+        ).fetchall()
+
+        for index, row in enumerate(remaining, start=1):
+            conn.execute(
+                "UPDATE connection_content SET sort_order=? WHERE id=?",
+                (index, row["id"])
+            )
+
+    return deleted
+
+
+def guide_item_summary(row, limit=40):
+    type_label = GUIDE_CONTENT_TYPE_LABELS.get(
+        row["content_type"],
+        row["content_type"]
+    )
+
+    snippet = faq_short_label(
+        row["text_content"] or row["caption"] or "",
+        limit
+    )
+
+    return f"{type_label}: {snippet}" if snippet else type_label
+
+
+def guide_delete_selection(admin_id, section, valid_ids=None):
+    with GUIDE_DELETE_LOCK:
+        selected = GUIDE_DELETE_SELECTIONS.setdefault(
+            (admin_id, section),
+            set()
+        )
+
+        if valid_ids is not None:
+            selected &= set(valid_ids)
+
+        return set(selected)
+
+
+def guide_delete_view(admin_id, section, page=0):
+    """متن و کیبورد صفحه «حذف یک یا چند مورد»."""
+
+    rows = get_connection_content_rows(
+        section
+    )
+
+    selected = guide_delete_selection(
+        admin_id,
+        section,
+        [row["id"] for row in rows]
+    )
+
+    label = guide_section_label(
+        section
+    )
+
+    kb = types.InlineKeyboardMarkup(
+        row_width=1
+    )
+
+    if not rows:
+        kb.add(
+            types.InlineKeyboardButton(
+                "⬅️ بازگشت",
+                callback_data=f"guide:section:{section}"
+            )
+        )
+
+        return (
+            f"🗑 <b>حذف یک یا چند مورد</b>\n"
+            f"{html_escape(label)}\n\n"
+            "محتوایی در این بخش وجود ندارد.",
+            kb
+        )
+
+    total_pages = max(
+        1,
+        (len(rows) + GUIDE_DELETE_PAGE_SIZE - 1) // GUIDE_DELETE_PAGE_SIZE
+    )
+
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 0
+
+    page = max(0, min(page, total_pages - 1))
+
+    start = page * GUIDE_DELETE_PAGE_SIZE
+
+    for number, row in enumerate(
+        rows[start:start + GUIDE_DELETE_PAGE_SIZE],
+        start=start + 1
+    ):
+        mark = "✅" if row["id"] in selected else "⬜️"
+
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{mark} {number}. {guide_item_summary(row, 30)}",
+                callback_data=f"gdel:t:{section}:{row['id']}:{page}"
+            )
+        )
+
+    nav = faq_page_nav_buttons(
+        page,
+        total_pages,
+        f"gdel:p:{section}"
+    )
+
+    if nav:
+        kb.row(*nav)
+
+    if len(selected) == len(rows):
+        kb.add(
+            types.InlineKeyboardButton(
+                "◻️ لغو انتخاب همه",
+                callback_data=f"gdel:n:{section}:{page}"
+            )
+        )
+    else:
+        kb.add(
+            types.InlineKeyboardButton(
+                "☑️ انتخاب همه",
+                callback_data=f"gdel:a:{section}:{page}"
+            )
+        )
+
+    if selected:
+        kb.add(
+            types.InlineKeyboardButton(
+                f"🗑 حذف موارد انتخاب‌شده ({len(selected)})",
+                callback_data=f"gdel:ask:{section}:{page}"
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data=f"guide:section:{section}"
+        )
+    )
+
+    text = (
+        f"🗑 <b>حذف یک یا چند مورد</b>\n"
+        f"{html_escape(label)}\n\n"
+        "روی هر موردی که می‌خواهید حذف شود بزنید تا تیک ✅ بخورد، "
+        "سپس «🗑 حذف موارد انتخاب‌شده» را بزنید.\n\n"
+        f"تعداد کل: <b>{len(rows)}</b> | انتخاب‌شده: <b>{len(selected)}</b>"
+    )
+
+    return text, kb
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -10218,7 +10704,21 @@ def open_connection_for_user(
     )
 
     if (
+        service == "wireguard"
+        and wireguard_guide_has_content()
+    ):
+
+        show_wireguard_connection_menu(
+            chat_id,
+            user_id,
+            call=call
+        )
+
+        return
+
+    if (
         service
+        and service != "wireguard"
         and connection_admin_content_count(service) > 0
     ):
 
@@ -10319,6 +10819,16 @@ def cb_connection_service(call):
         call.id
     )
 
+    if service == "wireguard":
+
+        show_wireguard_connection_menu(
+            call.message.chat.id,
+            call.from_user.id,
+            call=call
+        )
+
+        return
+
     save_nav(
         call.from_user.id,
         "connection_service",
@@ -10331,6 +10841,105 @@ def cb_connection_service(call):
     send_connection_content(
         call.message.chat.id,
         service
+    )
+
+
+def show_wireguard_connection_menu(
+    chat_id,
+    user_id,
+    call=None
+):
+    """زیرمنوی آموزش وایرگارد: موبایل / ویندوز / دانلود ابزارها."""
+
+    save_nav(
+        user_id,
+        "connection_wireguard",
+        "connection",
+        {}
+    )
+
+    if call is not None:
+
+        edit_or_send(
+            call,
+            WIREGUARD_CONNECTION_MENU_TEXT,
+            wireguard_connection_menu_keyboard(),
+            bottom_keyboard=connection_reply_keyboard()
+        )
+
+    else:
+
+        bot.send_message(
+            chat_id,
+            WIREGUARD_CONNECTION_MENU_TEXT,
+            reply_markup=wireguard_connection_menu_keyboard()
+        )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "connection_menu"
+)
+def cb_connection_menu(call):
+    bot.answer_callback_query(
+        call.id
+    )
+
+    save_nav(
+        call.from_user.id,
+        "connection",
+        "home",
+        {}
+    )
+
+    edit_or_send(
+        call,
+        CONNECTION_MENU_TEXT,
+        connection_menu_keyboard(),
+        bottom_keyboard=connection_reply_keyboard()
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith(
+        "connection_section:"
+    )
+)
+def cb_connection_section(call):
+    section = call.data.split(
+        ":",
+        1
+    )[1]
+
+    if (
+        section not in WIREGUARD_GUIDE_SECTIONS
+        and section != "wireguard"
+    ):
+
+        bot.answer_callback_query(
+            call.id,
+            "بخش پیدا نشد.",
+            show_alert=True
+        )
+
+        return
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    save_nav(
+        call.from_user.id,
+        "connection_service",
+        "connection_wireguard",
+        {
+            "service": section,
+            "parent_service": "wireguard"
+        }
+    )
+
+    send_connection_content(
+        call.message.chat.id,
+        section
     )
 
 
@@ -11980,17 +12589,79 @@ def cb_guide_service(call):
         call.id
     )
 
-    count = connection_admin_content_count(
+    if service == "wireguard":
+
+        edit_or_send(
+            call,
+            f"🎓 <b>{SERVICE_LABELS['wireguard']}</b>\n\n"
+            "بخش آموزشی را انتخاب کنید:",
+            admin_guide_wireguard_keyboard()
+        )
+
+        return
+
+    show_admin_guide_section(
+        call,
         service
+    )
+
+
+def show_admin_guide_section(call, section):
+    with GUIDE_DELETE_LOCK:
+        GUIDE_DELETE_SELECTIONS.pop(
+            (call.from_user.id, section),
+            None
+        )
+
+    count = connection_admin_content_count(
+        section
     )
 
     edit_or_send(
         call,
-        f"🎓 <b>{SERVICE_LABELS[service]}</b>\n\n"
+        f"🎓 <b>{guide_section_label(section)}</b>\n\n"
         f"تعداد محتوای ذخیره‌شده: <b>{count}</b>",
         admin_guide_service_keyboard(
-            service
+            section
         )
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith(
+        "guide:section:"
+    )
+)
+def cb_guide_section(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    section = call.data.split(
+        ":",
+        2
+    )[2]
+
+    if not is_guide_section(section):
+
+        bot.answer_callback_query(
+            call.id,
+            "بخش پیدا نشد.",
+            show_alert=True
+        )
+
+        return
+
+    clear_admin_state(
+        call.from_user.id
+    )
+
+    bot.answer_callback_query(
+        call.id
+    )
+
+    show_admin_guide_section(
+        call,
+        section
     )
 
 
@@ -12007,7 +12678,10 @@ def cb_guide_add(call):
         ":"
     )[-1]
 
-    if service not in SERVICE_LABELS:
+    if (
+        not is_guide_section(service)
+        or service == "wireguard"
+    ):
         return
 
     set_admin_state(
@@ -12022,11 +12696,22 @@ def cb_guide_add(call):
         call.id
     )
 
+    extra_note = ""
+
+    if service == DELIVERY_ATTACHMENT_SECTION:
+        extra_note = (
+            "\n\n📎 این محتوا هنگام تحویل سفارش (وایرساک / وایرگارد و V2Ray) "
+            "همراه با پیام آماده برای مشتری ارسال می‌شود.\n"
+            "می‌توانید فایل را همراه کپشن فوروارد کنید؛ نام فرستنده یا مبدا "
+            "پیام برای مشتری نمایش داده نمی‌شود."
+        )
+
     bot.send_message(
         call.from_user.id,
-        f"➕ <b>افزودن آموزش {SERVICE_LABELS[service]}</b>\n\n"
+        f"➕ <b>افزودن {guide_section_label(service)}</b>\n\n"
         "حالا پیام‌ها را یکی‌یکی بفرستید. متن، عکس، ویدئو، فایل، صدا و ویس پشتیبانی می‌شود.\n"
-        "هر تعداد محتوا که لازم دارید ارسال کنید و در پایان «اتمام افزودن» را بزنید.",
+        "هر تعداد محتوا که لازم دارید ارسال کنید و در پایان «اتمام افزودن» را بزنید."
+        f"{extra_note}",
         reply_markup=guide_upload_keyboard()
     )
 
@@ -12074,7 +12759,7 @@ def cb_guide_add_done(call):
 
     bot.send_message(
         call.from_user.id,
-        f"✅ افزودن آموزش {SERVICE_LABELS[service]} به پایان رسید.\n"
+        f"✅ افزودن آموزش {guide_section_label(service)} به پایان رسید.\n"
         f"تعداد محتوا: {connection_admin_content_count(service)}",
         reply_markup=kb
     )
@@ -12092,6 +12777,9 @@ def cb_guide_preview(call):
     service = call.data.split(
         ":"
     )[-1]
+
+    if not is_guide_section(service):
+        return
 
     clear_admin_state(
         call.from_user.id
@@ -12128,6 +12816,9 @@ def cb_guide_clear(call):
         ":"
     )[-1]
 
+    if not is_guide_section(service):
+        return
+
     clear_connection_content(
         service
     )
@@ -12144,7 +12835,7 @@ def cb_guide_clear(call):
 
     edit_or_send(
         call,
-        f"🎓 <b>{SERVICE_LABELS[service]}</b>\n\n"
+        f"🎓 <b>{guide_section_label(service)}</b>\n\n"
         "تمام محتوای آموزشی حذف شد.",
         admin_guide_service_keyboard(
             service
@@ -12166,7 +12857,7 @@ def cb_guide_send(call):
         2
     )[2]
 
-    if service not in SERVICE_LABELS:
+    if not is_guide_section(service):
 
         bot.answer_callback_query(
             call.id,
@@ -12200,10 +12891,288 @@ def cb_guide_send(call):
 
     bot.send_message(
         call.from_user.id,
-        f"📤 <b>ارسال آموزش {SERVICE_LABELS[service]}</b>\n\n"
+        f"📤 <b>ارسال آموزش {guide_section_label(service)}</b>\n\n"
         "شناسه عددی کاربر مقصد را ارسال کنید.\n\n"
         "برای لغو، /cancel بفرستید.",
         reply_markup=remove_keyboard()
+    )
+
+
+# ── 🗑 حذف یک یا چند مورد (callbackها) ───────────────────────────────────────
+
+def _guide_delete_parse(call):
+    """gdel:<action>:<section>[:<arg>...] → (action, section, args) یا None."""
+
+    parts = call.data.split(":")
+
+    if len(parts) < 3:
+        return None
+
+    action, section, args = parts[1], parts[2], parts[3:]
+
+    if not is_guide_section(section):
+        return None
+
+    return action, section, args
+
+
+def _guide_delete_show(call, section, page=0):
+    text, kb = guide_delete_view(
+        call.from_user.id,
+        section,
+        page
+    )
+
+    edit_or_send(
+        call,
+        text,
+        kb
+    )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("gdel:")
+)
+def cb_guide_delete(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    parsed = _guide_delete_parse(
+        call
+    )
+
+    if not parsed:
+
+        bot.answer_callback_query(
+            call.id,
+            "بخش پیدا نشد.",
+            show_alert=True
+        )
+
+        return
+
+    action, section, args = parsed
+    admin_id = call.from_user.id
+    key = (admin_id, section)
+
+    def arg_int(index, default=0):
+        try:
+            return int(args[index])
+        except (IndexError, ValueError):
+            return default
+
+    if action == "o":
+
+        clear_admin_state(
+            admin_id
+        )
+
+        with GUIDE_DELETE_LOCK:
+            GUIDE_DELETE_SELECTIONS[key] = set()
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        _guide_delete_show(
+            call,
+            section,
+            0
+        )
+
+        return
+
+    if action == "p":
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        _guide_delete_show(
+            call,
+            section,
+            arg_int(0)
+        )
+
+        return
+
+    if action == "t":
+
+        item_id = arg_int(0, None)
+        page = arg_int(1)
+
+        valid_ids = {
+            row["id"]
+            for row in get_connection_content_rows(section)
+        }
+
+        if item_id not in valid_ids:
+
+            bot.answer_callback_query(
+                call.id,
+                "این مورد دیگر وجود ندارد.",
+                show_alert=True
+            )
+
+            _guide_delete_show(
+                call,
+                section,
+                page
+            )
+
+            return
+
+        with GUIDE_DELETE_LOCK:
+            selected = GUIDE_DELETE_SELECTIONS.setdefault(
+                key,
+                set()
+            )
+
+            if item_id in selected:
+                selected.discard(item_id)
+            else:
+                selected.add(item_id)
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        _guide_delete_show(
+            call,
+            section,
+            page
+        )
+
+        return
+
+    if action in ("a", "n"):
+
+        ids = {
+            row["id"]
+            for row in get_connection_content_rows(section)
+        }
+
+        with GUIDE_DELETE_LOCK:
+            GUIDE_DELETE_SELECTIONS[key] = (
+                ids if action == "a" else set()
+            )
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        _guide_delete_show(
+            call,
+            section,
+            arg_int(0)
+        )
+
+        return
+
+    if action == "ask":
+
+        page = arg_int(0)
+
+        selected = guide_delete_selection(
+            admin_id,
+            section,
+            [row["id"] for row in get_connection_content_rows(section)]
+        )
+
+        if not selected:
+
+            bot.answer_callback_query(
+                call.id,
+                "هیچ موردی انتخاب نشده است.",
+                show_alert=True
+            )
+
+            _guide_delete_show(
+                call,
+                section,
+                page
+            )
+
+            return
+
+        bot.answer_callback_query(
+            call.id
+        )
+
+        kb = types.InlineKeyboardMarkup(
+            row_width=2
+        )
+
+        kb.row(
+            types.InlineKeyboardButton(
+                "✅ بله، حذف شود",
+                callback_data=f"gdel:do:{section}"
+            ),
+            types.InlineKeyboardButton(
+                "❌ انصراف",
+                callback_data=f"gdel:p:{section}:{page}"
+            )
+        )
+
+        edit_or_send(
+            call,
+            f"⚠️ <b>حذف یک یا چند مورد</b>\n"
+            f"{html_escape(guide_section_label(section))}\n\n"
+            f"آیا از حذف <b>{len(selected)}</b> مورد انتخاب‌شده مطمئن هستید؟\n"
+            "این کار قابل بازگشت نیست.",
+            kb
+        )
+
+        return
+
+    if action == "do":
+
+        selected = guide_delete_selection(
+            admin_id,
+            section,
+            [row["id"] for row in get_connection_content_rows(section)]
+        )
+
+        if not selected:
+
+            bot.answer_callback_query(
+                call.id,
+                "هیچ موردی انتخاب نشده است.",
+                show_alert=True
+            )
+
+            _guide_delete_show(
+                call,
+                section,
+                0
+            )
+
+            return
+
+        deleted = delete_connection_content_items(
+            section,
+            selected
+        )
+
+        with GUIDE_DELETE_LOCK:
+            GUIDE_DELETE_SELECTIONS[key] = set()
+
+        bot.answer_callback_query(
+            call.id,
+            f"✅ {deleted} مورد حذف شد.",
+            show_alert=True
+        )
+
+        _guide_delete_show(
+            call,
+            section,
+            0
+        )
+
+        return
+
+    bot.answer_callback_query(
+        call.id
     )
 
 
@@ -16474,7 +17443,7 @@ def admin_state_message(message):
 
                 bot.send_message(
                     message.chat.id,
-                    f"✅ آموزش {SERVICE_LABELS.get(service, service)} "
+                    f"✅ آموزش {guide_section_label(service)} "
                     f"برای کاربر <code>{target_id}</code> ارسال شد."
                 )
 
@@ -18413,7 +19382,20 @@ def navigate_back(message):
             greeting=False
         )
 
-    elif state == "connection_service":
+    elif (
+        state == "connection_service"
+        and data.get("parent_service") == "wireguard"
+    ):
+
+        show_wireguard_connection_menu(
+            message.chat.id,
+            message.from_user.id
+        )
+
+    elif state in (
+        "connection_service",
+        "connection_wireguard"
+    ):
 
         save_nav(
             message.from_user.id,
