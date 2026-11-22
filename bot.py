@@ -24363,7 +24363,12 @@ def maybe_send_admin_daily_digest(now_dt=None):
 
     local = now_dt.astimezone(timezone.utc) + IRAN_UTC_OFFSET
 
-    if local.hour != daily_digest_hour():
+    # حلقه‌ی بررسی انقضا هر ۳۶۰۰ ثانیه یک بار اجرا می‌شود و چون هر چرخه
+    # کارهایی هم انجام می‌دهد، به‌تدریج جابه‌جا می‌شود (drift). اگر شرط
+    # «ساعت دقیقاً برابر باشد» بگذاریم، ممکن است یک روز از ساعت تنظیم‌شده
+    # عبور کند و خلاصه اصلاً ارسال نشود. پس شرط درست این است: از ساعت
+    # تنظیم‌شده گذشته باشد و امروز هنوز ارسال نشده باشد.
+    if local.hour < daily_digest_hour():
         return False
 
     today = jalali_date_from_dt(now_dt)

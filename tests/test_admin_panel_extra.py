@@ -1116,11 +1116,32 @@ class DailyDigestTests(AdminExtraBase):
             bot.maybe_send_admin_daily_digest(now_dt=NOW + timedelta(days=1))
         )
 
-    def test_does_not_send_at_other_hours(self):
-        bot.set_daily_digest_hour(3)
+    def test_does_not_send_before_the_configured_hour(self):
+        bot.set_daily_digest_hour(20)   # ۲۰:۰۰ ایران؛ NOW ساعت ۱۵:۳۰ ایران است
 
         self.assertFalse(bot.maybe_send_admin_daily_digest(now_dt=NOW))
         self.assertEqual(self.sent, [])
+
+    def test_sends_when_the_hourly_loop_drifted_past_the_hour(self):
+        """
+        حلقه هر ۳۶۰۰ ثانیه یک بار اجرا می‌شود و به‌تدریج جابه‌جا می‌شود؛ اگر
+        از ساعت تنظیم‌شده عبور کرد، خلاصه‌ی همان روز نباید از دست برود.
+        """
+
+        bot.set_daily_digest_hour(9)
+
+        # ۰۴:۰۰ UTC = ۰۷:۳۰ ایران ⇒ هنوز نرسیده
+        early = NOW - timedelta(hours=8)
+        self.assertFalse(bot.maybe_send_admin_daily_digest(now_dt=early))
+        self.assertEqual(self.sent, [])
+
+        # ۰۷:۵۰ UTC = ۱۱:۲۰ ایران ⇒ حلقه دو ساعت دیرتر رسیده؛ باید ارسال شود
+        late = NOW - timedelta(hours=4, minutes=10)
+        self.assertTrue(bot.maybe_send_admin_daily_digest(now_dt=late))
+        self.assertIn("خلاصه‌ی روزانه", self.all_text())
+
+        # همان روز دوباره ارسال نمی‌شود
+        self.assertFalse(bot.maybe_send_admin_daily_digest(now_dt=NOW))
 
     def test_disabled_digest_is_not_sent(self):
         bot.set_daily_digest_enabled(False)
