@@ -1088,6 +1088,13 @@ def init_db():
                 "ALTER TABLE orders ADD COLUMN expired_at TEXT"
             )
 
+        # یادداشت خصوصی ادمین روی سفارش (برای پیگیری)؛ فقط ادمین‌ها می‌بینند.
+        for column in ("admin_note", "admin_note_updated_at"):
+            if column not in order_columns:
+                conn.execute(
+                    f"ALTER TABLE orders ADD COLUMN {column} TEXT"
+                )
+
         service_columns = {
             row["name"]
             for row in conn.execute(
@@ -6811,6 +6818,10 @@ def admin_stats_text():
             """
         ).fetchone()[0]
 
+    # 🚨 تحویل‌های ناموفق: سفارش‌های بازی که ساخت/تمدیدشان روی پنل خطا داده.
+    failed_deliveries = count_failed_deliveries()
+
+    with db() as conn:
         total_sales = conn.execute(
             """
             SELECT COALESCE(
@@ -6943,6 +6954,11 @@ def admin_stats_text():
         f"❌ سفارش‌های لغوشده: <b>{cancelled_orders:,}</b>",
         f"🚫 سفارش‌های ردشده: <b>{rejected_orders:,}</b>",
         f"🧹 سفارش‌های نیمه‌تمام (پرداخت‌نشده): <b>{stale_orders:,}</b>",
+        (
+            f"🚨 تحویل‌های ناموفق (نیاز به اقدام): <b>{failed_deliveries:,}</b>"
+            if failed_deliveries
+            else "🚨 تحویل‌های ناموفق: <b>0</b>"
+        ),
         "",
         "📦 <b>سرویس‌ها</b>",
         f"🟢 سرویس‌های فعال: <b>{active_services:,}</b>",
@@ -7135,6 +7151,27 @@ def admin_panel_keyboard(admin_id=None, chat_id=None):
         types.InlineKeyboardButton(
             "🧹 سفارش‌های نیمه‌تمام",
             callback_data="admin:stale_orders"
+        )
+    )
+
+    # 🚨 صف سفارش‌هایی که تحویلشان روی پنل ناموفق بوده و منتظر اقدام‌اند.
+    failed_count = count_failed_deliveries()
+
+    kb.row(
+        types.InlineKeyboardButton(
+            f"🚨 تحویل‌های ناموفق" + (f" ({failed_count})" if failed_count else ""),
+            callback_data="admin:failed_deliveries"
+        ),
+        types.InlineKeyboardButton(
+            "📤 خروجی CSV",
+            callback_data="admin:export"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔔 خلاصه‌ی روزانه",
+            callback_data="admin:digest"
         )
     )
 
@@ -18021,6 +18058,19 @@ def admin_order_dossier_sections(order_id, now_dt=None):
             f"🛰 وضعیت تحویل خودکار: <code>{esc(api_status)}</code>"
         )
 
+    # 📝 یادداشت خصوصی ادمین (فقط ادمین‌ها می‌بینند؛ برای مشتری ارسال نمی‌شود)
+    admin_note = order_admin_note(order)
+    if admin_note:
+        header.append(
+            f"📝 یادداشت ادمین: <i>{esc(admin_note[:600])}</i>"
+        )
+
+        note_stamp = order.get("admin_note_updated_at")
+        if note_stamp:
+            header.append(
+                f"   🕒 آخرین ویرایش یادداشت: {jalali_datetime_str(note_stamp)}"
+            )
+
     sections = ["\n".join(header)]
 
     # ── بخش ۲: مشتری ─────────────────────────────────────────────────────────
@@ -18634,6 +18684,17 @@ def admin_dossier_keyboard(kind, ident):
                 callback_data=f"admin:od:{ident}"
             ),
         )
+        # ⚡ اقدامات سریع (ارسال دوباره، تحویل دستی، تمدید، مرجوعی) و یادداشت
+        kb.row(
+            types.InlineKeyboardButton(
+                "⚡ اقدامات سریع",
+                callback_data=f"admin:order_actions:{ident}"
+            ),
+            types.InlineKeyboardButton(
+                "📝 یادداشت ادمین",
+                callback_data=f"admin:order_note:{ident}"
+            ),
+        )
     else:
         kb.row(
             types.InlineKeyboardButton(
@@ -18641,6 +18702,16 @@ def admin_dossier_keyboard(kind, ident):
                 callback_data=f"admin:dossier:{'s' if kind == 'service' else 't'}:{ident}"
             )
         )
+
+        if kind == "service":
+            # 🛠 عملیات مستقیم روی پنل: وضعیت زنده، ریست ترافیک، فعال/غیرفعال،
+            # ابطال لینک اشتراک.
+            kb.row(
+                types.InlineKeyboardButton(
+                    "🛠 عملیات پنل روی سرویس",
+                    callback_data=f"admin:service_panel:{ident}"
+                )
+            )
 
     kb.row(
         types.InlineKeyboardButton(
@@ -20004,6 +20075,30 @@ def admin_state_message(message):
     if mode == "order_search_lookup":
 
         handle_order_search_message(
+            message
+        )
+
+        return
+
+    if mode == "order_note_edit":
+
+        handle_order_note_message(
+            message
+        )
+
+        return
+
+    if mode == "order_extend_days":
+
+        handle_order_extend_message(
+            message
+        )
+
+        return
+
+    if mode == "digest_hour_set":
+
+        handle_digest_hour_message(
             message
         )
 
@@ -22328,6 +22423,2091 @@ def show_ai_context_from_user(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ADMIN: ابزارهای گسترش‌یافته
+#   🚨 صف تحویل‌های ناموفق · 📝 یادداشت ادمین روی سفارش · ⚡ اقدامات سریع
+#   🛠 عملیات پنل روی سرویس · 📤 خروجی CSV · 🔔 خلاصه‌ی روزانه‌ی ادمین
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: وضعیت‌هایی که یعنی تحویل روی پنل شکست خورده و سفارش هنوز باز است.
+FAILED_DELIVERY_STATUSES = ("failed", "failed_verification")
+
+#: سفارش‌هایی که پرونده‌شان بسته است و نباید در «نیاز به اقدام» بیایند.
+CLOSED_ORDER_STATUSES = (
+    "cancelled",
+    "rejected",
+    "expired_unpaid",
+    "refunded",
+)
+
+ORDER_DATES_STATUS_LABELS["refunded"] = "💰 مرجوع شده"
+
+ADMIN_NOTE_MAX_CHARS = 1500
+ADMIN_EXPORT_MAX_ROWS = 5000
+ADMIN_EXTEND_MAX_DAYS = 3650
+
+DAILY_DIGEST_ENABLED_KEY = "admin_daily_digest_enabled"
+DAILY_DIGEST_HOUR_KEY = "admin_daily_digest_hour"
+DAILY_DIGEST_LAST_KEY = "admin_daily_digest_last_date"
+DAILY_DIGEST_DEFAULT_HOUR = 9  # ساعت ۹ صبح به وقت ایران
+
+
+def _admin_order_row(order_id):
+    """ردیف سفارش + اطلاعات خریدار (dict) یا None."""
+
+    try:
+        order_id = int(order_id)
+    except (TypeError, ValueError):
+        return None
+
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE o.id=?
+            """,
+            (order_id,)
+        ).fetchone()
+
+    return dict(row) if row else None
+
+
+def _admin_call_id(call, name):
+    """آخرین بخش callback_data به‌عنوان عدد؛ در صورت نامعتبر بودن None."""
+
+    try:
+        return int(str(call.data).split(":")[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, f"{name} نامعتبر است.", show_alert=True)
+        return None
+
+
+def _admin_only(call):
+    """بررسی دسترسی ادمین؛ در صورت نبود دسترسی پاسخ می‌دهد و False."""
+
+    if call.from_user.id in ADMIN_IDS:
+        return True
+
+    bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+    return False
+
+
+# ── 🚨 صف تحویل‌های ناموفق ────────────────────────────────────────────────────
+
+def failed_delivery_orders(limit=None, now_dt=None):
+    """
+    سفارش‌هایی که تحویلشان روی پنل ناموفق بوده (یا خطای API ثبت شده) و هنوز
+    بسته نشده‌اند. این همان صفی است که ادمین باید هر روز نگاه کند؛ چون تا
+    رفع نشود مشتری چیزی تحویل نگرفته است.
+    """
+
+    limit = int(limit or ADMIN_TOOLS_LIST_LIMIT)
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    failed_marks = ",".join("?" for _ in FAILED_DELIVERY_STATUSES)
+    closed_marks = ",".join("?" for _ in CLOSED_ORDER_STATUSES)
+
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE (
+                o.api_status IN ({failed_marks})
+                OR (o.api_error IS NOT NULL AND TRIM(o.api_error) <> '')
+            )
+            AND o.status NOT IN ({closed_marks})
+            ORDER BY o.updated_at DESC
+            LIMIT ?
+            """,
+            (*FAILED_DELIVERY_STATUSES, *CLOSED_ORDER_STATUSES, limit)
+        ).fetchall()
+
+    items = []
+
+    for row in rows:
+        row = dict(row)
+        api_status = str(row.get("api_status") or "")
+        error = str(row.get("api_error") or "").strip()
+
+        reason = (
+            api_status
+            if api_status in FAILED_DELIVERY_STATUSES
+            else "خطای ثبت‌شده روی سفارش"
+        )
+
+        updated = _order_dates_parse(row.get("updated_at"))
+
+        items.append({
+            "id": int(row["id"]),
+            "row": row,
+            "reason": reason,
+            "error": error,
+            "waiting": format_span_fa(now_dt - updated) if updated else "—",
+        })
+
+    return items
+
+
+def count_failed_deliveries():
+    failed_marks = ",".join("?" for _ in FAILED_DELIVERY_STATUSES)
+    closed_marks = ",".join("?" for _ in CLOSED_ORDER_STATUSES)
+
+    with db() as conn:
+        try:
+            return int(conn.execute(
+                f"""
+                SELECT COUNT(*) FROM orders
+                WHERE (
+                    api_status IN ({failed_marks})
+                    OR (api_error IS NOT NULL AND TRIM(api_error) <> '')
+                )
+                AND status NOT IN ({closed_marks})
+                """,
+                (*FAILED_DELIVERY_STATUSES, *CLOSED_ORDER_STATUSES)
+            ).fetchone()[0])
+        except sqlite3.Error:
+            return 0
+
+
+def admin_failed_deliveries_text(now_dt=None, limit=None):
+    """متن صف تحویل‌های ناموفق + فهرست شناسه‌ها."""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+    items = failed_delivery_orders(limit=limit, now_dt=now_dt)
+    total = count_failed_deliveries()
+
+    lines = [
+        "🚨 <b>تحویل‌های ناموفق</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        f"📊 تعداد کل: <b>{total}</b>",
+        "",
+        "این‌ها سفارش‌هایی هستند که ساخت/تمدیدشان روی EylanPanel ناموفق بوده یا "
+        "با خطا متوقف شده‌اند. تا رفع نشوند مشتری چیزی تحویل نگرفته است؛ ربات هم "
+        "هرگز برای این‌ها پیام موفقیت نمی‌فرستد.",
+    ]
+
+    if not items:
+        lines.append("\n✅ مورد ناموفقی وجود ندارد.")
+        lines.append("\n" + ID_LEGEND)
+        return "\n".join(lines), []
+
+    lines.append("")
+
+    for item in items:
+        row = item["row"]
+
+        lines.append(
+            f"🧾 {order_code(row['id'])} — "
+            f"{esc(faq_short_label(row['product_title'], 34))}\n"
+            f"   👤 {esc(_akhavan_user_label(row))} (<code>{row['user_id']}</code>) | "
+            f"📌 {ORDER_DATES_STATUS_LABELS.get(row['status'], esc(row['status'] or '—'))}\n"
+            f"   ⚠️ دلیل: <b>{esc(item['reason'])}</b> | ⏱ {esc(item['waiting'])} بی‌اقدام"
+        )
+
+        if item["error"]:
+            lines.append(f"   📝 {esc(faq_short_label(item['error'], 220))}")
+
+    lines.append("")
+    lines.append(
+        "💡 «🔁 تلاش مجدد» عملیات را با force از اول روی پنل اجرا و بعد "
+        "راستی‌آزمایی می‌کند. اگر مشکل از تنظیمات باشد، اول «🩺 عیب‌یابی» را "
+        "اجرا کنید."
+    )
+    lines.append("")
+    lines.append(ID_LEGEND)
+
+    return "\n".join(lines), [item["id"] for item in items]
+
+
+def admin_failed_deliveries_keyboard(items=None, now_dt=None):
+    items = items if items is not None else failed_delivery_orders(now_dt=now_dt)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    for item in items[:8]:
+        kb.row(
+            types.InlineKeyboardButton(
+                f"🔁 تلاش مجدد {order_code(item['id'])}",
+                callback_data=f"admin:oact:retry:{item['id']}"
+            ),
+            types.InlineKeyboardButton(
+                f"📦 گزارش {order_code(item['id'])}",
+                callback_data=f"admin:dossier:o:{item['id']}"
+            ),
+        )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔄 بروزرسانی فهرست",
+            callback_data="admin:failed_deliveries"
+        ),
+        types.InlineKeyboardButton(
+            "🩺 عیب‌یابی EylanPanel",
+            callback_data="admin:eylan:diag"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:failed_deliveries"
+)
+def cb_admin_failed_deliveries(call):
+    if not _admin_only(call):
+        return
+
+    bot.answer_callback_query(call.id)
+
+    text, _ids = admin_failed_deliveries_text()
+    items = failed_delivery_orders()
+
+    edit_or_send(call, text, admin_failed_deliveries_keyboard(items))
+
+
+# ── 📝 یادداشت ادمین روی سفارش ────────────────────────────────────────────────
+
+def order_admin_note(order):
+    """
+    یادداشت خصوصی ادمین روی سفارش (برای پیگیری).
+
+    هم روی dict کار می‌کند هم sqlite3.Row و روی دیتابیس‌های قدیمی‌تر که ستون
+    هنوز اضافه نشده None برمی‌گرداند.
+    """
+
+    if order is None:
+        return None
+
+    try:
+        keys = order.keys()
+    except AttributeError:
+        return None
+
+    if "admin_note" not in keys:
+        return None
+
+    value = order["admin_note"]
+
+    return str(value).strip() if value else None
+
+
+def save_order_admin_note(order_id, note):
+    """ذخیره/پاک‌کردن یادداشت ادمین. مقدار بازگشتی: True اگر سفارش وجود داشت."""
+
+    note = str(note or "").strip()
+
+    if len(note) > ADMIN_NOTE_MAX_CHARS:
+        note = note[:ADMIN_NOTE_MAX_CHARS]
+
+    stamp = now() if note else None
+
+    with db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE orders
+            SET admin_note=?,
+                admin_note_updated_at=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (note or None, stamp, now(), int(order_id))
+        )
+
+        return cur.rowcount == 1
+
+
+def admin_order_note_prompt(order_id):
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return None
+
+    note = order_admin_note(order)
+
+    lines = [
+        f"📝 <b>یادداشت ادمین برای {order_code(order_id)}</b>",
+        f"🛍 {esc(order['product_title'] or '—')}",
+        f"👤 {esc(_akhavan_user_label(order))}",
+        "",
+        "یادداشت فعلی:",
+        esc(note) if note else "— (خالی)",
+        "",
+        f"یادداشت تازه را بفرستید (حداکثر {ADMIN_NOTE_MAX_CHARS} کاراکتر).",
+        "این یادداشت فقط برای ادمین‌هاست و برای مشتری ارسال نمی‌شود؛ در «گزارش "
+        "کامل سفارش» و «تحویل‌های ناموفق» نمایش داده می‌شود.",
+        "برای پاک کردن: <code>حذف</code> یا <code>-</code>",
+        "برای لغو: /cancel",
+    ]
+
+    return "\n".join(lines)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:order_note:")
+)
+def cb_admin_order_note(call):
+    if not _admin_only(call):
+        return
+
+    order_id = _admin_call_id(call, "شناسه سفارش")
+    if order_id is None:
+        return
+
+    prompt = admin_order_note_prompt(order_id)
+
+    if not prompt:
+        bot.answer_callback_query(call.id, "سفارش پیدا نشد.", show_alert=True)
+        return
+
+    clear_admin_state(call.from_user.id)
+    set_admin_state(
+        call.from_user.id,
+        "order_note_edit",
+        {"order_id": order_id}
+    )
+
+    bot.answer_callback_query(call.id, "یادداشت را بفرستید ✍️")
+    bot.send_message(call.message.chat.id, prompt)
+
+
+def handle_order_note_message(message):
+    """ورودی ادمین در حالت «یادداشت سفارش»."""
+
+    state = get_admin_state(message.from_user.id) or {}
+    order_id = int((state.get("data") or {}).get("order_id") or 0)
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "ℹ️ یادداشت را به صورت متن بفرستید (یا /cancel برای لغو)."
+        )
+        return
+
+    raw = (message.text or "").strip()
+
+    if not raw:
+        bot.send_message(message.chat.id, "❌ متن خالی است؛ چیزی بنویسید.")
+        return
+
+    if raw in {"-", "حذف", "پاک", "clear"}:
+        raw = ""
+
+    if not order_id or not _admin_order_row(order_id):
+        clear_admin_state(message.from_user.id)
+        bot.send_message(message.chat.id, "❌ سفارش پیدا نشد؛ دوباره از ابتدا بروید.")
+        return
+
+    save_order_admin_note(order_id, raw)
+    clear_admin_state(message.from_user.id)
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton(
+            "📦 گزارش کامل سفارش",
+            callback_data=f"admin:dossier:o:{order_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⚡ اقدامات سریع",
+            callback_data=f"admin:order_actions:{order_id}"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "📝 ویرایش دوباره یادداشت",
+            callback_data=f"admin:order_note:{order_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        ),
+    )
+
+    bot.send_message(
+        message.chat.id,
+        (
+            f"✅ یادداشت {order_code(order_id)} ذخیره شد:\n"
+            f"<i>{esc(raw[:400])}</i>"
+            if raw
+            else f"🗑 یادداشت {order_code(order_id)} پاک شد."
+        ),
+        reply_markup=kb
+    )
+
+
+# ── ⚡ اقدامات سریع سفارش ─────────────────────────────────────────────────────
+
+def admin_order_actions_text(order_id, now_dt=None):
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return None
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+    note = order_admin_note(order)
+    service = service_for_product(order["product_id"])
+
+    lines = [
+        f"⚡ <b>اقدامات سریع سفارش {order_code(order_id)}</b>",
+        f"🛍 محصول: <b>{esc(order['product_title'] or '—')}</b>",
+        f"👤 خریدار: {esc(_akhavan_user_label(order))} (<code>{order['user_id']}</code>)",
+        f"📌 وضعیت: {ORDER_DATES_STATUS_LABELS.get(order['status'], esc(order['status'] or '—'))}",
+        f"🛰 وضعیت پنل: <b>{esc(order.get('api_status') or '—')}</b>",
+        f"🔌 نوع سرویس: <code>{esc(service or '—')}</code>",
+        f"📝 یادداشت ادمین: {esc(note) if note else '—'}",
+        "",
+        "⚠️ این دکمه‌ها واقعاً روی دیتابیس (و در موارد پنل، روی EylanPanel) اثر "
+        "می‌گذارند. موارد حساس تأیید دوم دارند.",
+    ]
+
+    if order.get("api_error"):
+        lines.append("")
+        lines.append(f"❌ آخرین خطا: {esc(faq_short_label(order['api_error'], 300))}")
+
+    return "\n".join(lines)
+
+
+def admin_order_actions_keyboard(order_id, order=None):
+    order = order or _admin_order_row(order_id)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "📝 یادداشت ادمین",
+            callback_data=f"admin:order_note:{order_id}"
+        ),
+        types.InlineKeyboardButton(
+            "📨 ارسال دوباره پیام تحویل",
+            callback_data=f"admin:oact:resend:{order_id}"
+        ),
+    )
+
+    service = service_for_product(order["product_id"]) if order else None
+
+    if service == "wireguard":
+        kb.row(
+            types.InlineKeyboardButton(
+                "🔁 تلاش مجدد تحویل خودکار (force)",
+                callback_data=f"admin:oact:retry:{order_id}"
+            )
+        )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "⏳ تمدید دستی سرویس (تعداد روز)",
+            callback_data=f"admin:oact:extend:{order_id}"
+        ),
+        types.InlineKeyboardButton(
+            "✅ ثبت تحویل دستی",
+            callback_data=f"admin:oact:done:{order_id}"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "💰 مرجوع کردن مبلغ به کیف پول",
+            callback_data=f"admin:oact:refund:{order_id}"
+        )
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "📦 گزارش کامل سفارش",
+            callback_data=f"admin:dossier:o:{order_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        ),
+    )
+
+    return kb
+
+
+def _admin_confirm_keyboard(action, order_id, yes_label, back_label="⬅️ بازگشت"):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.row(
+        types.InlineKeyboardButton(
+            yes_label,
+            callback_data=f"admin:oact:{action}:yes:{order_id}"
+        ),
+        types.InlineKeyboardButton(
+            back_label,
+            callback_data=f"admin:order_actions:{order_id}"
+        ),
+    )
+    return kb
+
+
+def resend_order_delivery(admin_id, order_id):
+    """
+    ارسال دوباره‌ی پیام تحویل به مشتری.
+
+    اگر لینک/جیمیلی ثبت نشده باشد صادقانه می‌گوید چیزی برای ارسال نیست، تا
+    ادمین فکر کند تحویل انجام شده است.
+    """
+
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return False, "❌ سفارش پیدا نشد."
+
+    link = str(order.get("api_link") or "").strip()
+    gmail = str(order.get("gmail_address") or "").strip()
+    service = service_for_product(order["product_id"])
+
+    if not link and not gmail:
+        return False, (
+            "⚠️ چیزی برای ارسال مجدد وجود ندارد: نه لینک/اطلاعات تحویل ثبت شده "
+            "و نه جیمیل. اول سفارش را تحویل دهید (خودکار یا «✅ ثبت تحویل دستی»)."
+        )
+
+    if link and service in {"wireguard", "v2ray"}:
+        try:
+            text = delivery_template(service, link, order)
+        except Exception:
+            logger.exception("delivery_template failed for order #%s", order_id)
+            text = ""
+    else:
+        text = ""
+
+    if not text:
+        parts = [f"🛍 {order['product_title'] or 'سفارش شما'}"]
+
+        if link:
+            parts.append(f"🔗 {link}")
+        if gmail:
+            parts.append(f"📧 جیمیل: {gmail}")
+
+        parts.append("✅ این پیام به درخواست پشتیبانی دوباره ارسال شد.")
+        text = "\n".join(parts)
+
+    try:
+        sent = bot.send_message(
+            int(order["user_id"]),
+            text,
+            reply_markup=reply_main_keyboard()
+        )
+    except Exception as exc:
+        logger.exception("Resend delivery failed for order #%s", order_id)
+        return False, f"❌ ارسال پیام به مشتری ناموفق بود: {esc(str(exc))}"
+
+    save_order_api_state(order_id, delivery_message_id=sent.message_id)
+
+    return True, (
+        f"✅ پیام تحویل {order_code(order_id)} دوباره برای مشتری ارسال شد "
+        f"(message_id=<code>{sent.message_id}</code>)."
+    )
+
+
+def mark_order_delivered(admin_id, order_id):
+    """ثبت تحویل دستی (بدون پنل) + تکمیل سفارش + اطلاع به مشتری."""
+
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return False, "❌ سفارش پیدا نشد."
+
+    if order["status"] == "completed":
+        return False, "ℹ️ این سفارش قبلاً تکمیل شده است."
+
+    if order["status"] in {"cancelled", "rejected", "expired_unpaid", "refunded"}:
+        return False, (
+            f"⚠️ این سفارش در وضعیت «{ORDER_DATES_STATUS_LABELS.get(order['status'], order['status'])}» "
+            "است و تحویل دستی برایش منطقی نیست."
+        )
+
+    save_order_api_state(order_id, delivery_mode="manual_admin")
+    complete_order(order_id)
+
+    try:
+        bot.send_message(
+            int(order["user_id"]),
+            f"✅ سفارش {order_code(order_id)} "
+            f"({esc(order['product_title'] or '')}) تحویل شد.\n"
+            "اگر اطلاعات/لینک سرویس را دریافت نکرده‌اید، به پشتیبانی پیام بدهید.",
+            reply_markup=reply_main_keyboard()
+        )
+    except Exception:
+        logger.exception(
+            "Could not notify user %s about manual delivery of order #%s",
+            order["user_id"], order_id
+        )
+
+    logger.info(
+        "Admin %s marked order #%s as delivered manually", admin_id, order_id
+    )
+
+    return True, (
+        f"✅ سفارش {order_code(order_id)} به‌صورت دستی «تحویل‌شده» ثبت و تکمیل شد "
+        "و به مشتری اطلاع داده شد.\n"
+        "⚠️ اگر سرویس واقعاً در پنل ساخته نشده، «🔁 تلاش مجدد» یا «🛠 عملیات "
+        "پنل» را هم اجرا کنید تا مشتری اکانت نداشته نباشد."
+    )
+
+
+def refund_order_to_wallet(admin_id, order_id, note=""):
+    """
+    مرجوع کردن مبلغ سفارش به کیف پول مشتری.
+
+    مبلغ = رزرو کیف پول + پرداخت نقدی ثبت‌شده؛ یعنی دقیقاً همان چیزی که
+    مشتری از دست داده است (نه بیشتر، تا دوبار اعتبار نگیرد).
+    """
+
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return 0, "❌ سفارش پیدا نشد."
+
+    if order["status"] == "refunded":
+        return 0, "ℹ️ این سفارش قبلاً مرجوع شده است."
+
+    reserved = int(order.get("wallet_reserved") or 0)
+    paid = int(order.get("payment_amount") or 0)
+    total = reserved + paid
+
+    if total <= 0:
+        return 0, (
+            "⚠️ از این سفارش مبلغی پرداخت یا رزرو نشده بود؛ چیزی برای مرجوع "
+            "کردن نیست."
+        )
+
+    stamp = now()
+    reason = f"مرجوع توسط ادمین {admin_id}"
+    if note:
+        reason += f" — {note}"
+
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE users
+            SET balance=balance+?,
+                updated_at=?
+            WHERE user_id=?
+            """,
+            (total, stamp, int(order["user_id"]))
+        )
+
+        conn.execute(
+            """
+            INSERT INTO transactions(
+                user_id, order_id, kind, amount, note, created_at
+            )
+            VALUES (?, ?, 'refund', ?, ?, ?)
+            """,
+            (int(order["user_id"]), int(order_id), total, reason, stamp)
+        )
+
+        cur = conn.execute(
+            """
+            UPDATE orders
+            SET status='refunded',
+                updated_at=?
+            WHERE id=? AND status <> 'refunded'
+            """,
+            (stamp, int(order_id))
+        )
+
+    if cur.rowcount != 1:
+        return 0, "⚠️ سفارش همزمان توسط فرآیند دیگری تغییر کرد؛ دوباره بررسی کنید."
+
+    try:
+        bot.send_message(
+            int(order["user_id"]),
+            f"💰 مبلغ <b>{money(total)}</b> بابت سفارش {order_code(order_id)} "
+            "به کیف پول شما برگشت.\n"
+            + (f"دلیل: {esc(note)}\n" if note else "")
+            + "از «💳 کیف پول» می‌توانید برای خرید بعدی استفاده کنید.",
+            reply_markup=reply_main_keyboard()
+        )
+    except Exception:
+        logger.exception(
+            "Could not notify user %s about refund of order #%s",
+            order["user_id"], order_id
+        )
+
+    logger.info(
+        "Admin %s refunded order #%s: %s (reserved=%s, paid=%s)",
+        admin_id, order_id, total, reserved, paid
+    )
+
+    breakdown = " + ".join(
+        part for part in (
+            f"رزرو کیف پول {money(reserved)}" if reserved else "",
+            f"پرداخت نقدی {money(paid)}" if paid else "",
+        ) if part
+    )
+
+    return total, (
+        f"💰 مبلغ <b>{money(total)}</b> ({breakdown}) به کیف پول مشتری برگشت و "
+        f"وضعیت سفارش به «{ORDER_DATES_STATUS_LABELS['refunded']}» تغییر کرد.\n"
+        "تراکنش با نوع <code>refund</code> ثبت شد."
+    )
+
+
+def retry_failed_delivery(admin_id, order_id):
+    """
+    تلاش مجدد تحویل خودکار، بدون محدودیت «ادمین مسئول».
+
+    `deliver_eylan_order_via_api` عمداً فقط سفارش‌های `fulfilling` متعلق به همان
+    ادمین را قبول می‌کند؛ اینجا سفارش را به ادمین فعلی واگذار می‌کنیم (claim)
+    تا ادمین دوم هم بتواند سفارش گیرکرده را جلو ببرد.
+    """
+
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return False, "❌ سفارش پیدا نشد."
+
+    if service_for_product(order["product_id"]) != "wireguard":
+        return False, (
+            "⚠️ این محصول تحویل خودکار EylanPanel ندارد (فقط WireGuard خودکار "
+            "است). از «✅ ثبت تحویل دستی» یا ارسال دستی استفاده کنید."
+        )
+
+    if order["status"] == "completed":
+        return False, (
+            "ℹ️ این سفارش قبلاً تکمیل شده است. اگر اکانت در پنل مشکل دارد، از "
+            "«🛠 عملیات پنل روی سرویس» استفاده کنید."
+        )
+
+    if order["status"] in CLOSED_ORDER_STATUSES:
+        return False, "⚠️ این سفارش بسته شده است و قابل تحویل نیست."
+
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE orders
+            SET assigned_admin_id=?,
+                status='fulfilling',
+                updated_at=?
+            WHERE id=?
+            """,
+            (int(admin_id), now(), int(order_id))
+        )
+
+    save_order_api_state(order_id, delivery_mode="auto")
+
+    set_admin_state(
+        admin_id,
+        "fulfill",
+        {"order_id": int(order_id), "delivery_mode": "auto"}
+    )
+
+    bot.send_message(
+        admin_id,
+        f"⚙️ تلاش مجدد {order_code(order_id)}: عملیات از اول روی EylanPanel اجرا "
+        "و سپس راستی‌آزمایی می‌شود…"
+    )
+
+    # force=True ⇒ وضعیت ذخیره‌شده دور زده می‌شود و ساخت/تمدید واقعاً دوباره
+    # روی پنل اجرا می‌شود.
+    deliver_eylan_order_via_api(admin_id, int(order_id), force=True)
+
+    return True, ""
+
+
+def extend_order_service(admin_id, order_id, days, apply_panel=True, now_dt=None):
+    """
+    تمدید دستی سرویس یک سفارش به تعداد روز مشخص.
+
+    اول روی پنل اعمال می‌شود و راستی‌آزمایی می‌گردد؛ فقط اگر پنل قبول کرد (یا
+    سرویس اصلاً پنل‌دار نبود) در دیتابیس محلی هم اعمال می‌شود. این‌طور «تمدید
+    شد» الکی گفته نمی‌شود.
+
+    مبنای محاسبه، دیرترین زمان بین «الان» و «انقضای فعلی» است تا تمدید دستی
+    هرگز از عمر سرویس فعال کم نکند.
+    """
+
+    order = _admin_order_row(order_id)
+
+    if not order:
+        return {"ok": False, "message": "❌ سفارش پیدا نشد."}
+
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return {"ok": False, "message": "❌ تعداد روز باید عدد باشد."}
+
+    if days <= 0 or days > ADMIN_EXTEND_MAX_DAYS:
+        return {
+            "ok": False,
+            "message": f"❌ تعداد روز باید بین ۱ و {ADMIN_EXTEND_MAX_DAYS} باشد."
+        }
+
+    own, renewed = _order_services(int(order_id))
+    services = list(own) + list(renewed)
+
+    if not services:
+        return {
+            "ok": False,
+            "message": (
+                "⚠️ برای این سفارش سرویس زمان‌داری ثبت نشده است؛ اول سفارش را "
+                "تحویل دهید تا سرویس ساخته شود."
+            )
+        }
+
+    target = next((svc for svc in services if not svc["is_expired"]), services[-1])
+
+    now_dt = now_dt or _eylan_now()
+    current = _order_dates_parse(target["expires_at"])
+    base = max(now_dt, current) if current else now_dt
+    new_expiry = base + timedelta(days=days)
+
+    username = str(
+        target["service_username"]
+        or order.get("api_username")
+        or ""
+    ).strip()
+
+    service = service_for_product(order["product_id"])
+    panel_applied = False
+
+    if username and apply_panel and service in {"wireguard", "v2ray"}:
+        if not EYLAN_API_KEY:
+            return {
+                "ok": False,
+                "message": (
+                    "⚠️ نام کاربری پنل ثبت شده ولی <code>EYLAN_API_KEY</code> "
+                    "تنظیم نشده است؛ تمدید دستی فقط در دیتابیس اثر می‌کند و "
+                    "مشتری در پنل تمدید نمی‌شود. برای جلوگیری از گزارش اشتباه، "
+                    "انجام نشد."
+                )
+            }
+
+        try:
+            client = get_eylan_client()
+            client.update_user(
+                username,
+                {"expiry_date_str": new_expiry.date().isoformat()}
+            )
+            client.verify_expiry_extended(
+                username,
+                expected_date=new_expiry
+            )
+            panel_applied = True
+        except Exception as exc:
+            logger.exception(
+                "Manual extension failed on panel for order #%s", order_id
+            )
+            return {
+                "ok": False,
+                "message": (
+                    f"❌ تمدید روی پنل ناموفق بود و در دیتابیس هم اعمال نشد:\n"
+                    f"{esc(str(exc))}"
+                )
+            }
+
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE active_services
+            SET expires_at=?,
+                is_expired=0,
+                expiry_notified=0
+            WHERE id=?
+            """,
+            (new_expiry.isoformat(timespec="seconds"), int(target["id"]))
+        )
+
+    logger.info(
+        "Admin %s extended service #%s (order #%s) by %s day(s); panel=%s",
+        admin_id, target["id"], order_id, days, panel_applied
+    )
+
+    return {
+        "ok": True,
+        "service_id": int(target["id"]),
+        "new_expiry": new_expiry,
+        "panel": panel_applied,
+        "username": username,
+        "message": (
+            f"✅ سرویس {service_code(target['id'])} به مدت <b>{days}</b> روز تمدید "
+            f"شد.\n📅 انقضای جدید: {jalali_datetime_str(new_expiry.isoformat())}\n"
+            + (
+                f"🛰 روی پنل هم اعمال و راستی‌آزمایی شد (<code>{esc(username)}</code>)."
+                if panel_applied
+                else (
+                    "ℹ️ این سرویس نام کاربری پنل ندارد؛ فقط در دیتابیس ربات تمدید "
+                    "شد."
+                    if not username
+                    else "ℹ️ این محصول به پنل EylanPanel وصل نیست؛ فقط در دیتابیس "
+                       "ربات تمدید شد."
+                )
+            )
+        )
+    }
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:order_actions:")
+)
+def cb_admin_order_actions(call):
+    if not _admin_only(call):
+        return
+
+    order_id = _admin_call_id(call, "شناسه سفارش")
+    if order_id is None:
+        return
+
+    text = admin_order_actions_text(order_id)
+
+    if not text:
+        bot.answer_callback_query(call.id, "سفارش پیدا نشد.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    edit_or_send(call, text, admin_order_actions_keyboard(order_id))
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:oact:")
+)
+def cb_admin_order_action(call):
+    if not _admin_only(call):
+        return
+
+    parts = str(call.data).split(":")
+
+    # admin:oact:<action>:<id>  یا  admin:oact:<action>:yes:<id>
+    if len(parts) not in {4, 5}:
+        bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+        return
+
+    action = parts[2]
+    confirmed = len(parts) == 5 and parts[3] == "yes"
+
+    try:
+        order_id = int(parts[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "شناسه سفارش نامعتبر است.", show_alert=True)
+        return
+
+    chat_id = call.message.chat.id
+    order = _admin_order_row(order_id)
+
+    if not order:
+        bot.answer_callback_query(call.id, "سفارش پیدا نشد.", show_alert=True)
+        return
+
+    if action == "resend":
+        bot.answer_callback_query(call.id, "در حال ارسال…")
+        ok, message = resend_order_delivery(call.from_user.id, order_id)
+        bot.send_message(chat_id, message)
+        return
+
+    if action == "retry":
+        bot.answer_callback_query(call.id, "تلاش مجدد شروع شد…")
+
+        ok, message = retry_failed_delivery(call.from_user.id, order_id)
+
+        if not ok and message:
+            bot.send_message(chat_id, message)
+        return
+
+    if action == "done":
+        if not confirmed:
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                f"✅ <b>ثبت تحویل دستی {order_code(order_id)}</b>\n\n"
+                "سفارش «تکمیل‌شده» ثبت می‌شود، سود اخوان ثبت می‌شود و به مشتری "
+                "پیام تحویل می‌رود.\n"
+                "⚠️ فقط وقتی بزنید که سرویس/اطلاعات را واقعاً به مشتری داده‌اید.",
+                reply_markup=_admin_confirm_keyboard(
+                    "done", order_id, "✅ بله، تحویل دستی ثبت شود"
+                )
+            )
+            return
+
+        bot.answer_callback_query(call.id, "در حال ثبت…")
+        _ok, message = mark_order_delivered(call.from_user.id, order_id)
+        bot.send_message(chat_id, message, reply_markup=admin_order_actions_keyboard(order_id))
+        return
+
+    if action == "refund":
+        reserved = int(order.get("wallet_reserved") or 0)
+        paid = int(order.get("payment_amount") or 0)
+        total = reserved + paid
+
+        if not confirmed:
+            bot.answer_callback_query(call.id)
+            bot.send_message(
+                chat_id,
+                f"💰 <b>مرجوع کردن {order_code(order_id)}</b>\n\n"
+                f"رزرو کیف پول: {money(reserved)}\n"
+                f"پرداخت نقدی ثبت‌شده: {money(paid)}\n"
+                f"<b>مبلغ قابل برگشت: {money(total)}</b>\n\n"
+                "مبلغ به کیف پول مشتری اضافه می‌شود، تراکنش <code>refund</code> "
+                "ثبت می‌شود و وضعیت سفارش به «💰 مرجوع شده» تغییر می‌کند.\n"
+                "⚠️ سرویس ساخته‌شده در پنل حذف نمی‌شود؛ اگر لازم است از «🛠 "
+                "عملیات پنل» غیرفعالش کنید.",
+                reply_markup=_admin_confirm_keyboard(
+                    "refund", order_id, "💰 بله، مبلغ مرجوع شود"
+                )
+            )
+            return
+
+        bot.answer_callback_query(call.id, "در حال مرجوع کردن…")
+        _amount, message = refund_order_to_wallet(call.from_user.id, order_id)
+        bot.send_message(chat_id, message, reply_markup=admin_order_actions_keyboard(order_id))
+        return
+
+    if action == "extend":
+        clear_admin_state(call.from_user.id)
+        set_admin_state(
+            call.from_user.id,
+            "order_extend_days",
+            {"order_id": order_id}
+        )
+
+        bot.answer_callback_query(call.id, "تعداد روز را بفرستید")
+        bot.send_message(
+            chat_id,
+            f"⏳ <b>تمدید دستی {order_code(order_id)}</b>\n\n"
+            "تعداد روزهایی که می‌خواهید اضافه شود را بفرستید (مثلاً <code>30</code>).\n\n"
+            "اگر سرویس نام کاربری پنل داشته باشد، تمدید <b>اول روی EylanPanel</b> "
+            "اعمال و راستی‌آزمایی می‌شود و بعد در دیتابیس ربات؛ اگر پنل قبول "
+            "نکند، خطا می‌گیرید و چیزی تمدید نمی‌شود.\n"
+            "برای لغو: /cancel",
+            reply_markup=admin_tool_keyboard(f"admin:order_actions:{order_id}")
+        )
+        return
+
+    bot.answer_callback_query(call.id, "اقدام ناشناخته است.", show_alert=True)
+
+
+def handle_order_extend_message(message):
+    """ورودی ادمین در حالت «تمدید دستی سرویس»."""
+
+    state = get_admin_state(message.from_user.id) or {}
+    data = state.get("data") or {}
+    order_id = int(data.get("order_id") or 0)
+
+    if message.content_type != "text":
+        bot.send_message(message.chat.id, "ℹ️ فقط عدد روزها را به صورت متن بفرستید.")
+        return
+
+    raw = (message.text or "").translate(DIGIT_TRANSLATION).strip()
+
+    if not raw.isdigit():
+        bot.send_message(
+            message.chat.id,
+            "❌ عدد معتبر نیست. مثلاً بفرستید <code>30</code> (یا /cancel)."
+        )
+        return
+
+    clear_admin_state(message.from_user.id)
+
+    result = extend_order_service(message.from_user.id, order_id, int(raw))
+
+    kb = None
+    if result.get("ok"):
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.row(
+            types.InlineKeyboardButton(
+                "📦 گزارش کامل سفارش",
+                callback_data=f"admin:dossier:o:{order_id}"
+            ),
+            types.InlineKeyboardButton(
+                "🛠 عملیات پنل سرویس",
+                callback_data=f"admin:service_panel:{result['service_id']}"
+            ),
+        )
+        kb.row(
+            types.InlineKeyboardButton(
+                "⬅️ بازگشت به پنل",
+                callback_data="admin:home"
+            )
+        )
+
+    bot.send_message(message.chat.id, result["message"], reply_markup=kb)
+
+
+# ── 🛠 عملیات پنل روی سرویس ───────────────────────────────────────────────────
+
+SERVICE_PANEL_ACTIONS = ("status", "reset", "toggle", "revoke")
+
+
+def _service_panel_target(service_id):
+    """(ردیف سرویس به‌صورت dict, نام کاربری پنل) یا (None, None)."""
+
+    try:
+        service_id = int(service_id)
+    except (TypeError, ValueError):
+        return None, None
+
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT s.*,
+                   o.api_username AS order_api_username,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM active_services s
+            LEFT JOIN orders o ON o.id = s.order_id
+            LEFT JOIN users u ON u.user_id = s.user_id
+            WHERE s.id=?
+            """,
+            (service_id,)
+        ).fetchone()
+
+    if not row:
+        return None, None
+
+    row = dict(row)
+
+    username = str(row.get("service_username") or "").strip()
+
+    # برای سرویس‌های تست، order_id در واقع شناسه‌ی wireguard_trials است؛ پس
+    # api_username آن سفارشِ (بی‌ربط) را نباید استفاده کرد.
+    if not username and not is_trial_service(row):
+        username = str(row.get("order_api_username") or "").strip()
+
+    return row, username
+
+
+def admin_service_panel_text(service_id, now_dt=None, live=False):
+    now_dt = now_dt or datetime.now(timezone.utc)
+    svc, username = _service_panel_target(service_id)
+
+    if not svc:
+        return None
+
+    lines = [
+        f"🛠 <b>عملیات پنل روی سرویس {service_code(service_id)}</b>",
+        f"🛍 {esc(svc.get('product_title') or '—')}",
+        f"👤 {esc(_akhavan_user_label(svc))} (<code>{svc['user_id']}</code>)",
+        f"🔗 منشأ: {esc(service_ref_text(svc))}",
+        f"⏳ باقی‌مانده: {esc(service_remaining_label(svc.get('expires_at'), now_dt))}",
+        f"👤 نام کاربری پنل: <code>{esc(username)}</code>" if username else "👤 نام کاربری پنل: ثبت نشده",
+    ]
+
+    if not username:
+        lines += [
+            "",
+            "⚠️ بدون نام کاربری پنل، عملیات پنل ممکن نیست (فقط گزارش‌های محلی "
+            "در دسترس است)."
+        ]
+    elif not EYLAN_API_KEY:
+        lines += [
+            "",
+            "⚠️ <code>EYLAN_API_KEY</code> تنظیم نشده است؛ عملیات پنل غیرفعال است."
+        ]
+    elif live:
+        try:
+            client = get_eylan_client()
+            record = client.get_user_status(username)
+
+            lines += ["", "📡 <b>وضعیت زنده از پنل</b>"]
+            lines += [
+                f"   {esc(line)}" for line in panel_record_summary_lines(record)
+            ]
+        except Exception as exc:
+            lines += ["", f"❌ خواندن از پنل ناموفق بود: {esc(str(exc))}"]
+    else:
+        lines += [
+            "",
+            "برای دیدن وضعیت لحظه‌ای از پنل، «📡 وضعیت زنده پنل» را بزنید."
+        ]
+
+    lines += [
+        "",
+        "⚠️ این عملیات مستقیماً روی پنل EylanPanel اثر می‌گذارند و تأیید دوم دارند."
+    ]
+
+    return "\n".join(lines)
+
+
+def admin_service_panel_keyboard(service_id, svc=None):
+    if svc is None:
+        svc, _username = _service_panel_target(service_id)
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "📡 وضعیت زنده پنل",
+            callback_data=f"admin:spanel:status:{service_id}"
+        )
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "♻️ ریست ترافیک",
+            callback_data=f"admin:spanel:reset:{service_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⛔ فعال/غیرفعال کردن کاربر",
+            callback_data=f"admin:spanel:toggle:{service_id}"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔑 لینک اشتراک جدید (ابطال قبلی)",
+            callback_data=f"admin:spanel:revoke:{service_id}"
+        )
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "📦 گزارش کامل سرویس",
+            callback_data=f"admin:dossier:s:{service_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        ),
+    )
+
+    return kb
+
+
+def service_panel_action(service_id, action, admin_id):
+    """اجرای یک عملیات روی پنل؛ متن گزارش صادقانه برمی‌گرداند."""
+
+    if action not in SERVICE_PANEL_ACTIONS:
+        return "❌ عملیات ناشناخته است."
+
+    svc, username = _service_panel_target(service_id)
+
+    if not svc:
+        return "❌ سرویس پیدا نشد."
+
+    if not username:
+        return (
+            "⚠️ نام کاربری پنل برای این سرویس ثبت نشده است؛ عملیات پنل ممکن نیست."
+        )
+
+    if not EYLAN_API_KEY:
+        return "⚠️ <code>EYLAN_API_KEY</code> تنظیم نشده است."
+
+    client = get_eylan_client()
+
+    if action == "status":
+        record = client.get_user_status(username)
+        lines = [
+            f"📡 <b>وضعیت زنده‌ی <code>{esc(username)}</code></b>",
+            f"🕒 {jalali_datetime_str(now())}",
+            "",
+        ]
+        lines += [f"   {esc(line)}" for line in panel_record_summary_lines(record)]
+        return "\n".join(lines)
+
+    if action == "reset":
+        result = client.reset_traffic(username)
+
+        logger.info(
+            "Admin %s reset traffic for panel user %s (service #%s)",
+            admin_id, username, service_id
+        )
+
+        return (
+            f"♻️ ترافیک <code>{esc(username)}</code> ریست شد.\n"
+            f"📝 {esc(str(result.get('message') or ''))}\n"
+            f"🔓 کاربر دوباره فعال شد: <b>{bool(result.get('user_re_enabled'))}</b>"
+        )
+
+    if action == "toggle":
+        result = client.toggle_user(username)
+        is_active = bool(result.get("is_active"))
+
+        logger.info(
+            "Admin %s toggled panel user %s -> active=%s (service #%s)",
+            admin_id, username, is_active, service_id
+        )
+
+        return (
+            f"⛔ وضعیت <code>{esc(username)}</code> در پنل تغییر کرد.\n"
+            f"🟢 فعال است: <b>{is_active}</b>\n"
+            f"📝 {esc(str(result.get('message') or ''))}"
+        )
+
+    # revoke
+    new_link = client.revoke_subscription(username)
+
+    if not new_link:
+        return "❌ پنل لینک جدیدی برنگرداند؛ لینک قبلی باطل نشده است."
+
+    sent_to_user = False
+
+    try:
+        bot.send_message(
+            int(svc["user_id"]),
+            f"🔑 لینک اشتراک سرویس {service_code(service_id)} به درخواست "
+            "پشتیبانی باطل و لینک تازه صادر شد:\n\n"
+            f"{new_link}",
+            reply_markup=reply_main_keyboard()
+        )
+        sent_to_user = True
+    except Exception:
+        logger.exception(
+            "Could not send revoked subscription link to user %s", svc["user_id"]
+        )
+
+    logger.info(
+        "Admin %s revoked subscription for panel user %s (service #%s)",
+        admin_id, username, service_id
+    )
+
+    return (
+        f"🔑 لینک اشتراک قبلی <code>{esc(username)}</code> باطل شد و لینک تازه "
+        "ساخته شد.\n"
+        f"🔗 <code>{esc(new_link)}</code>\n"
+        + (
+            "✅ لینک تازه برای مشتری هم ارسال شد."
+            if sent_to_user
+            else "⚠️ ارسال لینک به مشتری ناموفق بود؛ خودتان برایش بفرستید."
+        )
+    )
+
+
+def _service_panel_confirm_keyboard(action, service_id, yes_label):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.row(
+        types.InlineKeyboardButton(
+            yes_label,
+            callback_data=f"admin:spanel:{action}:yes:{service_id}"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت",
+            callback_data=f"admin:service_panel:{service_id}"
+        ),
+    )
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:service_panel:")
+)
+def cb_admin_service_panel(call):
+    if not _admin_only(call):
+        return
+
+    service_id = _admin_call_id(call, "شناسه سرویس")
+    if service_id is None:
+        return
+
+    text = admin_service_panel_text(service_id)
+
+    if not text:
+        bot.answer_callback_query(call.id, "سرویس پیدا نشد.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id)
+    edit_or_send(call, text, admin_service_panel_keyboard(service_id))
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:spanel:")
+)
+def cb_admin_service_panel_action(call):
+    if not _admin_only(call):
+        return
+
+    parts = str(call.data).split(":")
+
+    if len(parts) not in {4, 5}:
+        bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+        return
+
+    action = parts[2]
+    confirmed = len(parts) == 5 and parts[3] == "yes"
+
+    try:
+        service_id = int(parts[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "شناسه سرویس نامعتبر است.", show_alert=True)
+        return
+
+    if action not in SERVICE_PANEL_ACTIONS:
+        bot.answer_callback_query(call.id, "عملیات ناشناخته است.", show_alert=True)
+        return
+
+    chat_id = call.message.chat.id
+
+    if action == "status":
+        bot.answer_callback_query(call.id, "در حال خواندن از پنل…")
+
+        try:
+            text = service_panel_action(service_id, "status", call.from_user.id)
+        except Exception as exc:
+            text = f"❌ خواندن از پنل ناموفق بود: {esc(str(exc))}"
+
+        bot.send_message(
+            chat_id,
+            text,
+            reply_markup=admin_service_panel_keyboard(service_id)
+        )
+        return
+
+    if not confirmed:
+        prompts = {
+            "reset": (
+                "♻️ <b>ریست ترافیک</b>\n\nحجم مصرفی این کاربر در پنل صفر می‌شود "
+                "و اگر به‌خاطر اتمام حجم غیرفعال شده باشد، دوباره فعال می‌شود.",
+                "♻️ بله، ترافیک ریست شود",
+            ),
+            "toggle": (
+                "⛔ <b>فعال/غیرفعال کردن کاربر</b>\n\nوضعیت کاربر در پنل برعکس "
+                "می‌شود. اگر الان فعال است، غیرفعال می‌شود (و برعکس).",
+                "⛔ بله، وضعیت عوض شود",
+            ),
+            "revoke": (
+                "🔑 <b>ابطال لینک اشتراک</b>\n\nلینک فعلی باطل می‌شود و لینک تازه "
+                "ساخته و برای مشتری ارسال می‌شود. مناسب وقتی لینک لو رفته است.",
+                "🔑 بله، لینک تازه صادر شود",
+            ),
+        }
+
+        prompt, yes_label = prompts[action]
+
+        bot.answer_callback_query(call.id)
+        bot.send_message(
+            chat_id,
+            prompt,
+            reply_markup=_service_panel_confirm_keyboard(
+                action, service_id, yes_label
+            )
+        )
+        return
+
+    bot.answer_callback_query(call.id, "در حال اجرا روی پنل…")
+
+    try:
+        text = service_panel_action(service_id, action, call.from_user.id)
+    except Exception as exc:
+        logger.exception(
+            "Service panel action %s failed for service #%s", action, service_id
+        )
+        text = f"❌ عملیات ناموفق بود: {esc(str(exc))}"
+
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=admin_service_panel_keyboard(service_id)
+    )
+
+
+# ── 📤 خروجی CSV ──────────────────────────────────────────────────────────────
+
+def _write_csv_file(path, header, rows):
+    import csv
+
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+    return path
+
+
+def export_orders_csv(directory, limit=None, now_dt=None):
+    """خروجی CSV سفارش‌ها (با ستون‌های تحویل/پنل/یادداشت ادمین)."""
+
+    limit = int(limit or ADMIN_EXPORT_MAX_ROWS)
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            ORDER BY o.id DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    header = [
+        "ردیف",
+        "شماره سفارش",
+        "کد کامل",
+        "تاریخ ثبت (شمسی)",
+        "تاریخ ثبت (UTC)",
+        "وضعیت",
+        "آیدی عددی مشتری",
+        "یوزرنیم تلگرام",
+        "نام",
+        "محصول",
+        "شناسه محصول",
+        f"قیمت ({CURRENCY_LABEL})",
+        f"رزرو کیف پول ({CURRENCY_LABEL})",
+        f"پرداخت نقدی ({CURRENCY_LABEL})",
+        "جیمیل",
+        "نام کاربری سرویس",
+        "نام کاربری پنل",
+        "لینک پنل",
+        "وضعیت API",
+        "خطای API",
+        "راستی‌آزمایی پنل",
+        "تغییر نام توسط پنل",
+        "یادداشت ادمین",
+        "تحویل (شمسی)",
+        "انقضا (UTC)",
+    ]
+
+    data = []
+
+    for index, row in enumerate(rows, start=1):
+        row = dict(row)
+
+        data.append([
+            index,
+            int(row["id"]),
+            order_code_long(row["id"]),
+            jalali_datetime_str(row.get("created_at")),
+            row.get("created_at") or "",
+            ORDER_DATES_STATUS_LABELS.get(row.get("status"), row.get("status") or ""),
+            row.get("user_id") or "",
+            row.get("username") or "",
+            row.get("first_name") or "",
+            row.get("product_title") or "",
+            row.get("product_id") or "",
+            int(row.get("price") or 0),
+            int(row.get("wallet_reserved") or 0),
+            int(row.get("payment_amount") or 0),
+            row.get("gmail_address") or "",
+            row.get("service_username") or "",
+            row.get("api_username") or "",
+            row.get("api_link") or "",
+            row.get("api_status") or "",
+            row.get("api_error") or "",
+            row.get("api_verified_at") or "",
+            row.get("api_renamed_from") or "",
+            order_admin_note(row) or "",
+            jalali_datetime_str(row.get("completed_at")),
+            row.get("expired_at") or "",
+        ])
+
+    path = os.path.join(directory, f"orders_{now_dt.strftime('%Y%m%d_%H%M')}.csv")
+
+    return _write_csv_file(path, header, data), len(data)
+
+
+def export_services_csv(directory, limit=None, now_dt=None):
+    """خروجی CSV سرویس‌های فعال با منشأ (سفارش/تست) و زمان باقی‌مانده."""
+
+    limit = int(limit or ADMIN_EXPORT_MAX_ROWS)
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM active_services s
+            LEFT JOIN users u ON u.user_id = s.user_id
+            ORDER BY s.id DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    header = [
+        "ردیف",
+        "شناسه سرویس",
+        "منشأ",
+        "کد منشأ",
+        "آیدی عددی مشتری",
+        "یوزرنیم تلگرام",
+        "نام",
+        "محصول",
+        "نوع سرویس",
+        "نام کاربری پنل",
+        "جیمیل",
+        "شروع (شمسی)",
+        "انقضا (شمسی)",
+        "انقضا (UTC)",
+        "باقی‌مانده",
+        "منقضی شده؟",
+        "سفارش تمدیدکننده",
+    ]
+
+    data = []
+
+    for index, row in enumerate(rows, start=1):
+        row = dict(row)
+
+        data.append([
+            index,
+            int(row["id"]),
+            service_origin_label(row),
+            service_origin_code(row),
+            row.get("user_id") or "",
+            row.get("username") or "",
+            row.get("first_name") or "",
+            row.get("product_title") or "",
+            row.get("service_type") or "",
+            row.get("service_username") or "",
+            row.get("gmail_address") or "",
+            jalali_datetime_str(row.get("started_at")),
+            jalali_datetime_str(row.get("expires_at")),
+            row.get("expires_at") or "",
+            service_remaining_label(row.get("expires_at"), now_dt),
+            "بله" if row.get("is_expired") else "خیر",
+            int(row["renewal_order_id"]) if row.get("renewal_order_id") else "",
+        ])
+
+    path = os.path.join(directory, f"services_{now_dt.strftime('%Y%m%d_%H%M')}.csv")
+
+    return _write_csv_file(path, header, data), len(data)
+
+
+def admin_export_menu_text():
+    return (
+        "📤 <b>خروجی CSV</b>\n\n"
+        "فایل با رمزگذاری <code>utf-8-sig</code> ساخته می‌شود تا در Excel "
+        "فارسی‌ها درست نمایش داده شوند.\n\n"
+        f"🧾 سفارش‌ها: تا {ADMIN_EXPORT_MAX_ROWS} ردیف آخر، شامل قیمت، وضعیت، "
+        "جیمیل، نام کاربری پنل، وضعیت/خطای API، زمان راستی‌آزمایی و یادداشت "
+        "ادمین.\n"
+        f"📦 سرویس‌ها: تا {ADMIN_EXPORT_MAX_ROWS} ردیف آخر، با منشأ (سفارش/تست)، "
+        "تاریخ شروع و انقضا و زمان باقی‌مانده."
+    )
+
+
+def admin_export_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.row(
+        types.InlineKeyboardButton(
+            "🧾 خروجی سفارش‌ها",
+            callback_data="admin:export:orders"
+        ),
+        types.InlineKeyboardButton(
+            "📦 خروجی سرویس‌ها",
+            callback_data="admin:export:services"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:export"
+)
+def cb_admin_export_menu(call):
+    if not _admin_only(call):
+        return
+
+    bot.answer_callback_query(call.id)
+    edit_or_send(call, admin_export_menu_text(), admin_export_keyboard())
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:export:")
+)
+def cb_admin_export(call):
+    if not _admin_only(call):
+        return
+
+    parts = str(call.data).split(":")
+
+    if len(parts) != 3 or parts[2] not in {"orders", "services"}:
+        bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+        return
+
+    kind = parts[2]
+
+    bot.answer_callback_query(call.id, "در حال ساخت فایل…")
+
+    with tempfile.TemporaryDirectory(prefix="admin_export_") as directory:
+        try:
+            if kind == "orders":
+                path, count = export_orders_csv(directory)
+                caption = f"🧾 <b>خروجی سفارش‌ها</b>\n🔢 تعداد ردیف: {count}"
+            else:
+                path, count = export_services_csv(directory)
+                caption = f"📦 <b>خروجی سرویس‌ها</b>\n🔢 تعداد ردیف: {count}"
+
+            with open(path, "rb") as f:
+                bot.send_document(call.from_user.id, f, caption=caption)
+        except Exception as exc:
+            logger.exception("CSV export (%s) failed", kind)
+            bot.send_message(
+                call.from_user.id,
+                f"❌ ساخت فایل ناموفق بود: {esc(str(exc))}"
+            )
+
+
+# ── 🔔 خلاصه‌ی روزانه‌ی ادمین ─────────────────────────────────────────────────
+
+def daily_digest_enabled():
+    return get_setting(DAILY_DIGEST_ENABLED_KEY, "1") == "1"
+
+
+def set_daily_digest_enabled(flag):
+    set_setting(DAILY_DIGEST_ENABLED_KEY, "1" if flag else "0")
+
+
+def daily_digest_hour():
+    try:
+        hour = int(get_setting(DAILY_DIGEST_HOUR_KEY, DAILY_DIGEST_DEFAULT_HOUR))
+    except (TypeError, ValueError):
+        hour = DAILY_DIGEST_DEFAULT_HOUR
+
+    return min(23, max(0, hour))
+
+
+def set_daily_digest_hour(hour):
+    hour = min(23, max(0, int(hour)))
+    set_setting(DAILY_DIGEST_HOUR_KEY, hour)
+    return hour
+
+
+def admin_daily_digest_text(now_dt=None):
+    """
+    خلاصه‌ی یک روز کاری: دیروز چه فروختیم، الان چه چیزهایی منتظر اقدام است.
+
+    بازه‌ی «دیروز» از نیمه‌شب ایران حساب می‌شود (مثل گزارش فروش).
+    """
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    start = iran_day_start_utc(now_dt, 1)
+    end = iran_day_start_utc(now_dt, 0)
+    day_ago = now_dt - timedelta(hours=24)
+
+    start_iso = start.isoformat(timespec="seconds")
+    end_iso = end.isoformat(timespec="seconds")
+    day_ago_iso = day_ago.isoformat(timespec="seconds")
+
+    with db() as conn:
+        sales = conn.execute(
+            """
+            SELECT COUNT(*) AS c, COALESCE(SUM(price), 0) AS s
+            FROM orders
+            WHERE status='completed'
+              AND completed_at>=? AND completed_at<?
+            """,
+            (start_iso, end_iso)
+        ).fetchone()
+
+        new_orders = conn.execute(
+            """
+            SELECT COUNT(*) AS c, COALESCE(SUM(price), 0) AS s
+            FROM orders
+            WHERE created_at>=? AND created_at<?
+            """,
+            (start_iso, end_iso)
+        ).fetchone()
+
+        pending = conn.execute(
+            """
+            SELECT COUNT(*) FROM orders
+            WHERE status IN (
+                'awaiting_receipt', 'receipt_submitted',
+                'paid_pending_fulfillment', 'fulfilling'
+            )
+            """
+        ).fetchone()[0]
+
+        expiring = conn.execute(
+            """
+            SELECT COUNT(*) FROM active_services
+            WHERE is_expired=0
+              AND expires_at IS NOT NULL
+              AND expires_at>? AND expires_at<=?
+            """,
+            (
+                now_dt.isoformat(timespec="seconds"),
+                (now_dt + timedelta(days=3)).isoformat(timespec="seconds"),
+            )
+        ).fetchone()[0]
+
+        stale_closed = conn.execute(
+            """
+            SELECT COUNT(*) FROM orders
+            WHERE status='expired_unpaid'
+              AND expired_at IS NOT NULL
+              AND expired_at>=?
+            """,
+            (day_ago_iso,)
+        ).fetchone()[0]
+
+        new_users = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE created_at>=?",
+            (day_ago_iso,)
+        ).fetchone()[0]
+
+        top = conn.execute(
+            """
+            SELECT product_title, COUNT(*) AS c, COALESCE(SUM(price), 0) AS s
+            FROM orders
+            WHERE status='completed'
+              AND completed_at>=? AND completed_at<?
+            GROUP BY product_title
+            ORDER BY s DESC
+            LIMIT 3
+            """,
+            (start_iso, end_iso)
+        ).fetchall()
+
+    failed = count_failed_deliveries()
+
+    lines = [
+        "🔔 <b>خلاصه‌ی روزانه</b>",
+        f"📅 {jalali_date_from_dt(start)} → {jalali_date_from_dt(end)} (به وقت ایران)",
+        "",
+        "💰 <b>دیروز</b>",
+        f"✅ فروش تکمیل‌شده: <b>{int(sales['c'])}</b> سفارش — {money(int(sales['s']))}",
+        f"🆕 سفارش ثبت‌شده: <b>{int(new_orders['c'])}</b> — {money(int(new_orders['s']))}",
+        f"👥 کاربران جدید (۲۴ ساعت): <b>{int(new_users)}</b>",
+        "",
+        "📌 <b>نیاز به اقدام</b>",
+        f"⏳ سفارش‌های باز (فیش/تحویل): <b>{int(pending)}</b>",
+        f"🚨 تحویل‌های ناموفق: <b>{failed}</b>",
+        f"⏰ سرویس‌های رو به انقضا (۳ روز): <b>{int(expiring)}</b>",
+        f"🧹 نیمه‌تمام بسته‌شده (۲۴ ساعت): <b>{int(stale_closed)}</b>",
+    ]
+
+    if top:
+        lines.append("")
+        lines.append("🏆 <b>پرفروش‌های دیروز</b>")
+
+        for row in top:
+            lines.append(
+                f"   • {esc(faq_short_label(row['product_title'], 34))}: "
+                f"{int(row['c'])} × {money(int(row['s']))}"
+            )
+
+    if failed:
+        lines.append("")
+        lines.append("⚠️ تحویل ناموفق دارید؛ لطفاً صف را بررسی کنید.")
+
+    return "\n".join(lines)
+
+
+def admin_digest_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton(
+            "🚨 تحویل‌های ناموفق",
+            callback_data="admin:failed_deliveries"
+        ),
+        types.InlineKeyboardButton(
+            "🧾 سفارش‌های در انتظار",
+            callback_data="admin:pending_orders"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "⏳ رو به انقضا",
+            callback_data="admin:expiring"
+        ),
+        types.InlineKeyboardButton(
+            "📈 گزارش فروش",
+            callback_data="admin:sales"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔔 تنظیمات خلاصه روزانه",
+            callback_data="admin:digest"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        ),
+    )
+    return kb
+
+
+def send_admin_daily_digest(now_dt=None):
+    """ارسال خلاصه‌ی روزانه برای همه‌ی ادمین‌ها؛ تعداد ارسال‌های موفق."""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+    text = admin_daily_digest_text(now_dt)
+    kb = admin_digest_keyboard()
+
+    sent = 0
+
+    for admin_id in sorted(ADMIN_IDS):
+        try:
+            bot.send_message(admin_id, text, reply_markup=kb)
+            sent += 1
+        except Exception:
+            logger.exception("Could not send daily digest to admin %s", admin_id)
+
+    return sent
+
+
+def maybe_send_admin_daily_digest(now_dt=None):
+    """
+    اگر خلاصه‌ی روزانه فعال باشد و ساعت ایران به ساعت تنظیم‌شده رسیده باشد،
+    یک بار در روز ارسال می‌شود (از حلقه‌ی ساعتانه صدا زده می‌شود).
+    """
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    if not daily_digest_enabled():
+        return False
+
+    local = now_dt.astimezone(timezone.utc) + IRAN_UTC_OFFSET
+
+    if local.hour != daily_digest_hour():
+        return False
+
+    today = jalali_date_from_dt(now_dt)
+
+    if get_setting(DAILY_DIGEST_LAST_KEY) == today:
+        return False
+
+    sent = send_admin_daily_digest(now_dt)
+
+    if sent:
+        set_setting(DAILY_DIGEST_LAST_KEY, today)
+        logger.info("Daily admin digest sent for %s to %s admin(s)", today, sent)
+
+    return bool(sent)
+
+
+def admin_digest_menu_text():
+    hour = daily_digest_hour()
+    enabled = daily_digest_enabled()
+    last = get_setting(DAILY_DIGEST_LAST_KEY)
+
+    return (
+        "🔔 <b>خلاصه‌ی روزانه‌ی ادمین</b>\n\n"
+        f"وضعیت: <b>{'🟢 روشن' if enabled else '🔴 خاموش'}</b>\n"
+        f"ساعت ارسال: <b>{hour:02d}:00 به وقت ایران</b>\n"
+        f"آخرین ارسال: {esc(last) if last else '—'}\n\n"
+        "هر روز یک پیام شامل فروش دیروز، سفارش‌های جدید، سفارش‌های باز، "
+        "🚨 تحویل‌های ناموفق، سرویس‌های رو به انقضا و نیمه‌تمام‌های بسته‌شده "
+        "برای همه‌ی ادمین‌ها ارسال می‌شود.\n\n"
+        "برای تغییر ساعت، «⏰ تغییر ساعت» را بزنید و عدد ۰ تا ۲۳ (به وقت ایران) "
+        "را بفرستید."
+    )
+
+
+def admin_digest_menu_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔴 خاموش کردن خلاصه روزانه"
+            if daily_digest_enabled()
+            else "🟢 روشن کردن خلاصه روزانه",
+            callback_data="admin:digest:toggle"
+        )
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "⏰ تغییر ساعت ارسال",
+            callback_data="admin:digest:hour"
+        ),
+        types.InlineKeyboardButton(
+            "📨 ارسال همین حالا",
+            callback_data="admin:digest:now"
+        ),
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+    return kb
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:digest" or c.data.startswith("admin:digest:")
+)
+def cb_admin_digest(call):
+    if not _admin_only(call):
+        return
+
+    parts = str(call.data).split(":")
+    action = parts[2] if len(parts) > 2 else ""
+
+    if not action:
+        bot.answer_callback_query(call.id)
+        edit_or_send(call, admin_digest_menu_text(), admin_digest_menu_keyboard())
+        return
+
+    chat_id = call.message.chat.id
+
+    if action == "toggle":
+        new_state = not daily_digest_enabled()
+        set_daily_digest_enabled(new_state)
+        bot.answer_callback_query(
+            call.id,
+            "روشن شد 🟢" if new_state else "خاموش شد 🔴"
+        )
+        edit_or_send(call, admin_digest_menu_text(), admin_digest_menu_keyboard())
+        return
+
+    if action == "now":
+        bot.answer_callback_query(call.id, "در حال ارسال…")
+        sent = send_admin_daily_digest()
+        bot.send_message(
+            chat_id,
+            f"📨 خلاصه‌ی روزانه برای <b>{sent}</b> ادمین ارسال شد.",
+            reply_markup=admin_digest_menu_keyboard()
+        )
+        return
+
+    if action == "hour":
+        clear_admin_state(call.from_user.id)
+        set_admin_state(call.from_user.id, "digest_hour_set", {})
+        bot.answer_callback_query(call.id, "ساعت را بفرستید")
+        bot.send_message(
+            chat_id,
+            "⏰ ساعت ارسال خلاصه‌ی روزانه را به وقت ایران بفرستید "
+            "(عدد ۰ تا ۲۳، مثلاً <code>9</code> یعنی ۹ صبح).\n"
+            "برای لغو: /cancel",
+            reply_markup=admin_tool_keyboard("admin:digest")
+        )
+        return
+
+    bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+
+
+def handle_digest_hour_message(message):
+    """ورودی ادمین در حالت «تنظیم ساعت خلاصه‌ی روزانه»."""
+
+    if message.content_type != "text":
+        bot.send_message(message.chat.id, "ℹ️ فقط عدد ساعت را به صورت متن بفرستید.")
+        return
+
+    raw = (message.text or "").translate(DIGIT_TRANSLATION).strip()
+
+    if not raw.isdigit() or not (0 <= int(raw) <= 23):
+        bot.send_message(
+            message.chat.id,
+            "❌ ساعت باید عددی بین ۰ تا ۲۳ باشد (به وقت ایران)."
+        )
+        return
+
+    hour = set_daily_digest_hour(int(raw))
+    clear_admin_state(message.from_user.id)
+
+    bot.send_message(
+        message.chat.id,
+        f"✅ ساعت ارسال خلاصه‌ی روزانه روی <b>{hour:02d}:00 به وقت ایران</b> "
+        "تنظیم شد.",
+        reply_markup=admin_digest_menu_keyboard()
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # EXPIRY CHECK
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -22525,6 +24705,19 @@ def check_expiry_loop():
 
             logger.exception(
                 "Error closing stale unpaid orders"
+            )
+
+        # ── 🔔 خلاصه‌ی روزانه‌ی ادمین ─────────────────────────────────────────
+        # یک بار در روز، در ساعت تنظیم‌شده (به وقت ایران)، خلاصه‌ی فروش دیروز و
+        # کارهای معطل‌شده برای همه‌ی ادمین‌ها ارسال می‌شود.
+        try:
+
+            maybe_send_admin_daily_digest()
+
+        except Exception:
+
+            logger.exception(
+                "Error sending daily admin digest"
             )
 
         time.sleep(
