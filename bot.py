@@ -19,6 +19,8 @@ from dotenv import load_dotenv
 from eylanpanel_api import (
     EylanPanelClient,
     EylanPanelError,
+    EylanPanelNotFound,
+    EylanPanelVerificationError,
 )
 
 
@@ -210,6 +212,47 @@ EYLAN_WG_INTERFACES = parse_wg_interfaces(
     os.getenv("EYLAN_WG_INTERFACES", "wg1,wg2,wg3")
 )
 
+
+def parse_bool_env(name, default=True):
+    raw = os.getenv(name)
+    if raw is None or not str(raw).strip():
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_int_env(name, default, minimum=0, maximum=None):
+    raw = str(os.getenv(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        value = int(float(raw))
+    except ValueError:
+        print(
+            f"[boot] WARNING: {name}='{raw}' عدد معتبر نیست؛ "
+            f"از مقدار پیش‌فرض {default} استفاده می‌شود.",
+            flush=True
+        )
+        return int(default)
+    if value < minimum:
+        return int(minimum)
+    if maximum is not None and value > maximum:
+        return int(maximum)
+    return value
+
+
+# بعد از هر ساخت/تمدید، کاربر را از پنل دوباره می‌خوانیم تا مطمئن شویم تغییر
+# واقعاً اعمال شده است. اگر این راستی‌آزمایی خاموش شود، ربات دوباره می‌تواند
+# «موفق» گزارش دهد در حالی که در پنل اتفاقی نیفتاده است.
+EYLAN_VERIFY_AFTER_WRITE = parse_bool_env("EYLAN_VERIFY_AFTER_WRITE", True)
+
+# بعد از تمدید، حجم مصرفی مشتری در پنل صفر و قفل حجم باز می‌شود
+# (POST /api/v1/users/<username>/reset_traffic).
+EYLAN_RENEWAL_RESET_TRAFFIC = parse_bool_env("EYLAN_RENEWAL_RESET_TRAFFIC", True)
+
+# یادداشت داخل پنل برای هر اکانت؛ باعث می‌شود در خود پنل هم معلوم باشد
+# این کاربر از کدام سفارش تلگرام ساخته شده است.
+EYLAN_WRITE_ORDER_NOTES = parse_bool_env("EYLAN_WRITE_ORDER_NOTES", True)
+
 # فقط وضعیت تنظیمات را در لاگ استارت چاپ می‌کنیم (خود کلید هرگز چاپ نمی‌شود)
 # تا بعد از تغییر متغیرها در لاگ Deploy مشخص باشد ربات آن‌ها را دیده است یا نه.
 print(
@@ -220,7 +263,9 @@ print(
         else "MISSING"
     )
     + f" | nodes={','.join(EYLAN_REQUIRED_NODE_NAMES)}"
-    + f" | wg={','.join(EYLAN_WG_INTERFACES)}",
+    + f" | wg={','.join(EYLAN_WG_INTERFACES)}"
+    + f" | verify_after_write={EYLAN_VERIFY_AFTER_WRITE}"
+    + f" | renewal_reset_traffic={EYLAN_RENEWAL_RESET_TRAFFIC}",
     flush=True
 )
 
@@ -512,6 +557,94 @@ TRIAL_USAGE_DAYS = 1
 TRIAL_SERVICE_TYPE = "wireguard_trial"
 TRIAL_PRODUCT_ID = "wireguard-trial"
 TRIAL_PRODUCT_TITLE = "اکانت تست رایگان — وایرساک / وایرگارد"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# شناسه‌های یکتا و بدون ابهام
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# مشکل قبلی: سه جدول مختلف، همه با قالب «#عدد» نمایش داده می‌شدند.
+#
+#   orders.id          → «شماره سفارش»   (چیزی که مشتری در فاکتور می‌بیند)
+#   active_services.id → «شناسه سرویس»   (چیزی که مشتری در سرویس‌های من می‌بیند)
+#   wireguard_trials.id→ «شناسه تست»     (که داخل active_services.order_id هم
+#                                         می‌نشیند!)
+#
+# پس وقتی مشتری می‌گفت «سفارش من #48 است»، ادمین نمی‌دانست این ۴۸ از کدام
+# جدول آمده و در جستجو یک سفارش کاملاً متفاوت برمی‌گشت.
+#
+# قرارداد جدید (در همه‌ی پیام‌های کاربر و ادمین یکسان است):
+#
+#   #48    یا ORD-48  → سفارش
+#   S-46              → سرویس فعال
+#   T-12              → اکانت تست
+#
+ID_LEGEND = (
+    "🔢 <b>راهنمای شناسه‌ها</b>\n"
+    "   <code>#48</code> یا <code>ORD-48</code> = شماره‌ی سفارش\n"
+    "   <code>S-46</code> = شناسه‌ی سرویس فعال\n"
+    "   <code>T-12</code> = شناسه‌ی اکانت تست"
+)
+
+
+def order_code(order_id):
+    """۴۸ → «#48» (همان چیزی که مشتری در فاکتور می‌بیند)."""
+
+    return f"#{int(order_id)}"
+
+
+def order_code_long(order_id):
+    """۴۸ → «ORD-48»؛ برای وقتی که باید بدون هیچ ابهامی نوشته شود."""
+
+    return f"ORD-{int(order_id)}"
+
+
+def service_code(service_id):
+    """۴۶ → «S-46»."""
+
+    return f"S-{int(service_id)}"
+
+
+def trial_code(trial_id):
+    """۱۲ → «T-12»."""
+
+    return f"T-{int(trial_id)}"
+
+
+def is_trial_service(svc):
+    try:
+        return svc["service_type"] == TRIAL_SERVICE_TYPE
+    except Exception:
+        return False
+
+
+def service_origin_label(svc):
+    """
+    برای سرویس‌های عادی: «سفارش»؛ برای سرویس تست: «تست».
+
+    نکته‌ی مهم: در سرویس‌های تست، ستون active_services.order_id در واقع
+    شناسه‌ی ردیف wireguard_trials است نه یک سفارش. پس نوشتن «سفارش #N» برای
+    آن‌ها کاملاً غلط بود و خودش یکی از منابع قاطی‌شدن شماره‌هاست.
+    """
+
+    return "تست" if is_trial_service(svc) else "سفارش"
+
+
+def service_origin_code(svc):
+    """«#30» برای سفارش، «T-12» برای تست."""
+
+    order_id = svc["order_id"]
+
+    if is_trial_service(svc):
+        return trial_code(order_id)
+
+    return order_code(order_id)
+
+
+def service_ref_text(svc):
+    """«(سفارش #30)» یا «(تست T-12)»."""
+
+    return f"({service_origin_label(svc)} {service_origin_code(svc)})"
 
 TRIAL_IMPORTANT_NOTES = (
     "‼️ <b>نکات بسیار مهم درباره اکانت تست</b>\n"
@@ -932,6 +1065,27 @@ def init_db():
                 ALTER TABLE orders
                 ADD COLUMN delivery_mode TEXT
                 """
+            )
+
+        # ── راستی‌آزمایی تحویل خودکار ─────────────────────────────────────────
+        # api_verified_at: زمانی که ربات با خواندن مجدد کاربر از پنل، ساخت/تمدید
+        # را تأیید کرد. api_panel_snapshot: خلاصه‌ی JSON همان خواندن (حجم،
+        # انقضا، نودها). api_renamed_from: اگر پنل نام کاربری را عوض کرده باشد.
+        for column, ddl_type in (
+            ("api_verified_at", "TEXT"),
+            ("api_panel_snapshot", "TEXT"),
+            ("api_renamed_from", "TEXT"),
+        ):
+            if column not in order_columns:
+                conn.execute(
+                    f"ALTER TABLE orders ADD COLUMN {column} {ddl_type}"
+                )
+
+        # سفارش‌های نیمه‌تمام (کاربر تا مرحله‌ی پرداخت نرفته) با این ستون
+        # بسته می‌شوند تا شماره‌ی سفارش‌ها بی‌جهت مصرف‌شده به نظر نرسد.
+        if "expired_at" not in order_columns:
+            conn.execute(
+                "ALTER TABLE orders ADD COLUMN expired_at TEXT"
             )
 
         service_columns = {
@@ -4723,13 +4877,118 @@ def _resolve_singbox_inbounds(client, plan):
     return tags
 
 
+def eylan_wg_instance_names():
+    """
+    نام اینستنس‌های وایرگارد اضافه (wg2 به بعد) که باید به کاربر داده شوند.
+
+    طبق مستندات EylanPanel فیلد درست «wg_instances» است (آرایه‌ای از نام‌ها،
+    مثل ["wg2", "wg3"]). فیلدهای enable_wg2 / enable_wg3 در API وجود ندارند و
+    پنل بی‌صدا نادیده‌شان می‌گرفت؛ به همین دلیل کاربران ساخته‌شده فقط wg1 داشتند.
+    """
+
+    return [name for name in EYLAN_WG_INTERFACES if name != "wg1"]
+
+
+def eylan_order_note(order=None, kind=""):
+    """
+    یادداشتی که داخل خود پنل روی اکانت نوشته می‌شود تا از سمت پنل هم معلوم
+    باشد این کاربر از کدام سفارش/مشتری تلگرامی ساخته یا تمدید شده است.
+    """
+
+    if not EYLAN_WRITE_ORDER_NOTES:
+        return None
+
+    parts = ["Hamid-Shop"]
+
+    if kind:
+        parts.append(str(kind))
+
+    if order is not None:
+        try:
+            parts.append(f"order #{order['id']}")
+            parts.append(f"tg {order['user_id']}")
+        except Exception:
+            pass
+
+    note = " | ".join(parts)
+
+    # ستون notes در پنل محدودیت سختی ندارد ولی کوتاه نگهش می‌داریم.
+    return note[:180]
+
+
+def _plan_activation_type(plan):
+    value = str(plan.get("activation_type") or "fixed_date").strip()
+    return value if value in {"fixed_date", "flexible_days"} else "fixed_date"
+
+
+def _eylan_now():
+    """
+    «اکنون» برای محاسبه‌های مربوط به پنل.
+
+    یک تابع جداست تا هم نقطه‌ی واحد تغییر باقی بماند و هم در تست‌ها قابل
+    جایگزینی باشد (محاسبه‌ی تاریخ تمدید باید قطعی و تکرارپذیر تست شود).
+    """
+
+    return datetime.now(timezone.utc)
+
+
+def _remote_expiry_base(remote, fallback):
+    """
+    دیت‌تایم مبنای تمدید: هرکدام که دیرتر باشد — الان یا انقضای فعلی پنل.
+    این‌طور تمدید هرگز سرویس فعال را کوتاه نمی‌کند.
+    """
+
+    base_dt = fallback
+
+    if isinstance(remote, dict):
+        for key in (
+            "expiry_date_actual_iso",
+            "expiry_date",
+            "expiry_date_str",
+            "expires_at",
+            "expiry_datetime",
+        ):
+            raw = remote.get(key)
+            if not raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(
+                    str(raw).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError):
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            base_dt = max(base_dt, parsed.astimezone(timezone.utc))
+            break
+
+    return base_dt
+
+
 def eylan_payload_for_product(
     product_id,
     username,
     *,
     for_update=False,
     client=None,
+    remote=None,
+    order=None,
+    note=None,
 ):
+    """
+    ساخت بدنه‌ی درخواست مطابق مستندات رسمی EylanPanel (نسخه ۴.۰.۱.۴).
+
+    POST /api/v1/users  → username, max_clients, data_limit, data_limit_unit,
+        activation_type, expiry_days | expiry_date_str | pending_activation_days,
+        nodes, enable_wg1, wg_instances, enable_openvpn, enable_l2tp,
+        enable_cisco, enable_singbox, singbox_inbounds, notes
+
+    PUT /api/v1/users/<username> → همان فیلدها به‌جز username، و مهم‌تر از همه
+        «expiry_days» در PUT مستند نشده است؛ برای تمدید باید expiry_date_str
+        فرستاد. (قبلاً برای پلن‌های flexible_days فقط expiry_days فرستاده می‌شد
+        و پنل نادیده می‌گرفت ⇒ تمدید «موفق» ولی بی‌اثر.)
+    """
+
     plan = eylan_plan_for_product(product_id)
 
     if not EYLAN_USERNAME_RE.fullmatch((username or "").strip()):
@@ -4743,105 +5002,112 @@ def eylan_payload_for_product(
             f"محصول «{product_id}» برای اتوماسیون EylanPanel سرویس معتبری ندارد."
         )
 
+    api_client = client or get_eylan_client()
+
     payload = {
-        "max_clients": int(plan.get("max_clients", 1)),
-        "data_limit": plan.get("data_limit", 0),
-        "data_limit_unit": plan.get("data_limit_unit", "GB"),
+        "max_clients": max(1, int(plan.get("max_clients", 1))),
+        "data_limit_unit": str(plan.get("data_limit_unit", "GB")).upper(),
     }
+
+    data_limit = plan.get("data_limit")
+    if product_id == TRIAL_PRODUCT_ID and EYLAN_TRIAL_DATA_LIMIT is not None:
+        data_limit = EYLAN_TRIAL_DATA_LIMIT
+
+    # ۰ یا null یعنی نامحدود (طبق مستندات).
+    if data_limit is None:
+        payload["data_limit"] = 0
+    else:
+        payload["data_limit"] = data_limit
 
     # The EylanPanel API supports a `nodes` array. For this shop we explicitly
     # resolve and attach all the required nodes instead of relying on panel
     # defaults, so no customer silently receives a partial node set.
-    api_client = client or get_eylan_client()
     payload["nodes"] = _resolve_required_node_ids(api_client, plan)
 
+    order_note = note if note is not None else eylan_order_note(order)
+    if order_note:
+        payload["notes"] = order_note
+
     if service == "wireguard":
-        payload.update({
-            "activation_type": plan.get("activation_type", "fixed_date"),
-            "enable_wg1": bool(plan.get("enable_wg1", True)),
-            "enable_openvpn": bool(plan.get("enable_openvpn", False)),
-        })
+        activation_type = _plan_activation_type(plan)
+        payload["enable_wg1"] = bool(plan.get("enable_wg1", True))
+        payload["enable_openvpn"] = bool(plan.get("enable_openvpn", False))
+        payload["enable_l2tp"] = bool(plan.get("enable_l2tp", False))
+        payload["enable_cisco"] = bool(plan.get("enable_cisco", False))
 
-        # wg2 / wg3 (Germany-3 و Turkey-4) هم باید روی کاربر فعال شوند، وگرنه
-        # پنل آن Nodeها را برای کاربر اضافه نمی‌کند.
-        for interface in EYLAN_WG_INTERFACES:
-            if interface != "wg1":
-                payload[f"enable_{interface}"] = bool(
-                    plan.get(f"enable_{interface}", True)
-                )
-
-        data_limit = plan.get("data_limit")
-        if product_id == TRIAL_PRODUCT_ID and EYLAN_TRIAL_DATA_LIMIT is not None:
-            data_limit = EYLAN_TRIAL_DATA_LIMIT
-        if data_limit is None:
-            payload.pop("data_limit", None)
-        else:
-            payload["data_limit"] = data_limit
+        # wg2 / wg3 (Germany-3 و Turkey-4) با فیلد wg_instances فعال می‌شوند.
+        wg_instances = eylan_wg_instance_names()
+        if wg_instances:
+            payload["wg_instances"] = wg_instances
 
         if for_update:
-            activation_type = payload["activation_type"]
             if activation_type == "flexible_days":
-                payload["pending_activation_days"] = int(
-                    plan.get("pending_activation_days", 2)
+                # کاربر ممکن است قبلاً وصل شده باشد؛ در آن حالت پنل فقط
+                # pending_activation_days را برای اکانتِ هنوز فعال‌نشده می‌پذیرد
+                # و برای اکانت فعال‌شده باید تاریخ انقضا داد. هر دو را می‌فرستیم
+                # تا تمدید در هر دو حالت واقعاً اعمال شود.
+                payload["pending_activation_days"] = max(
+                    1, int(plan.get("pending_activation_days", 2))
                 )
-                payload["expiry_days"] = int(plan.get("expiry_days", 1))
-            else:
-                # Extend from the later of now/current remote expiry so a
-                # renewal never shortens an already-active service.
-                remote = None
-                if client is not None:
-                    remote = client.get_user(username)
-                base_dt = datetime.now(timezone.utc)
-                if isinstance(remote, dict):
-                    for key in ("expiry_date", "expires_at", "expiry_date_str"):
-                        raw = remote.get(key)
-                        if not raw:
-                            continue
-                        try:
-                            raw_text = str(raw).replace("Z", "+00:00")
-                            parsed = datetime.fromisoformat(raw_text)
-                            if parsed.tzinfo is None:
-                                parsed = parsed.replace(tzinfo=timezone.utc)
-                            base_dt = max(base_dt, parsed.astimezone(timezone.utc))
-                            break
-                        except (TypeError, ValueError):
-                            continue
-                expiry_days = int(plan.get("expiry_days", 30))
+                base_dt = _remote_expiry_base(remote, _eylan_now())
+                expiry_days = max(1, int(plan.get("expiry_days", 1)))
                 payload["expiry_date_str"] = (
                     base_dt + timedelta(days=expiry_days)
                 ).date().isoformat()
+            else:
+                # Extend from the later of now/current remote expiry so a
+                # renewal never shortens an already-active service.
+                base_dt = _remote_expiry_base(remote, _eylan_now())
+                expiry_days = max(1, int(plan.get("expiry_days", 30)))
+                payload["expiry_date_str"] = (
+                    base_dt + timedelta(days=expiry_days)
+                ).date().isoformat()
+
             return payload
 
         payload["username"] = username.strip()
-        if payload["activation_type"] == "fixed_date":
-            payload["expiry_days"] = int(plan.get("expiry_days", 30))
+        payload["activation_type"] = activation_type
+
+        if activation_type == "fixed_date":
+            payload["expiry_days"] = max(1, int(plan.get("expiry_days", 30)))
         else:
-            payload["expiry_days"] = int(plan.get("expiry_days", 1))
-            payload["pending_activation_days"] = int(
-                plan.get("pending_activation_days", 2)
+            # برای flexible_days فقط pending_activation_days معتبر است و
+            # ارسال expiry_days باعث خطای «مقدار نامعتبر» در پنل می‌شود.
+            payload["pending_activation_days"] = max(
+                1, int(plan.get("pending_activation_days", 2))
             )
+
         return payload
 
     # V2Ray in EylanPanel is exposed through Sing-box. These shop products are
     # time-unlimited, so no fixed expiry field is sent. Access is controlled
     # by the data limit and the allowed Sing-box inbounds.
-    payload.update({
-        "enable_singbox": True,
-    })
-    if not for_update:
-        # A brand-new V2Ray user starts with WireGuard/OpenVPN disabled.
-        payload["enable_wg1"] = False
-        payload["enable_openvpn"] = False
-    inbounds = _resolve_singbox_inbounds(
-        client or get_eylan_client(),
-        plan,
-    )
+    payload["enable_singbox"] = True
+    payload["enable_wg1"] = False
+    payload["enable_openvpn"] = bool(plan.get("enable_openvpn", False))
+    payload["enable_l2tp"] = False
+    payload["enable_cisco"] = False
+
+    inbounds = _resolve_singbox_inbounds(api_client, plan)
     payload["singbox_inbounds"] = inbounds
 
     if not for_update:
         payload["username"] = username.strip()
 
     return payload
+
+
+def eylan_expected_expiry_date(payload):
+    """تاریخ انقضایی که از پنل انتظار داریم بعد از تمدید ثبت شده باشد."""
+
+    raw = payload.get("expiry_date_str")
+    if not raw:
+        return None
+
+    try:
+        return datetime.strptime(str(raw), "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def local_username_belongs_to_user(
@@ -4891,57 +5157,100 @@ def local_username_belongs_to_user(
     return True
 
 
-def save_order_api_state(
-    order_id,
-    *,
-    api_username=None,
-    api_link=None,
-    api_status=None,
-    api_error=None,
-    service_username=None,
-    delivery_message_id=None,
-    delivery_mode=None,
-):
+#: ستون‌های مجازی که save_order_api_state اجازه‌ی نوشتنشان را دارد.
+ORDER_API_COLUMNS = {
+    "api_username",
+    "api_link",
+    "api_status",
+    "api_error",
+    "api_verified_at",
+    "api_panel_snapshot",
+    "api_renamed_from",
+    "service_username",
+    "delivery_message_id",
+    "delivery_mode",
+    "expired_at",
+}
+
+
+def save_order_api_state(order_id, **values):
+    """
+    نوشتن وضعیت تحویل خودکار روی سفارش.
+
+    فقط ستون‌های سفید‌شده پذیرفته می‌شوند تا هیچ‌وقت با ورودی اشتباه، ستون
+    دیگری (مثل مبلغ یا وضعیت سفارش) ناخواسته عوض نشود. مقدار None یعنی
+    «دست نزن»؛ برای پاک کردن یک ستون رشته‌ی خالی بفرستید.
+    """
+
+    unknown = set(values) - ORDER_API_COLUMNS
+    if unknown:
+        raise ValueError(
+            f"save_order_api_state: unknown column(s) {sorted(unknown)}"
+        )
+
     fields = []
-    values = []
+    params = []
 
-    if api_username is not None:
-        fields.append("api_username=?")
-        values.append(api_username)
-
-    if api_link is not None:
-        fields.append("api_link=?")
-        values.append(api_link)
-
-    if api_status is not None:
-        fields.append("api_status=?")
-        values.append(api_status)
-
-    if api_error is not None:
-        fields.append("api_error=?")
-        values.append(api_error)
-
-    if service_username is not None:
-        fields.append("service_username=?")
-        values.append(service_username)
-
-    if delivery_message_id is not None:
-        fields.append("delivery_message_id=?")
-        values.append(delivery_message_id)
-
-    if delivery_mode is not None:
-        fields.append("delivery_mode=?")
-        values.append(delivery_mode)
+    for column, value in values.items():
+        if value is None:
+            continue
+        fields.append(f"{column}=?")
+        params.append(value)
 
     fields.append("updated_at=?")
-    values.append(now())
-    values.append(order_id)
+    params.append(now())
+    params.append(order_id)
 
     with db() as conn:
         conn.execute(
             f"UPDATE orders SET {', '.join(fields)} WHERE id=?",
-            tuple(values)
+            tuple(params)
         )
+
+
+def panel_snapshot_json(record, limit=900):
+    """خلاصه‌ی کوچک و امن از رکورد کاربر پنل، برای گزارش ادمین."""
+
+    if not isinstance(record, dict):
+        return ""
+
+    keys = (
+        "username",
+        "is_active",
+        "is_online",
+        "data_limit",
+        "data_limit_unit",
+        "expiry_date_actual_iso",
+        "expiry_date",
+        "expiry_date_str",
+        "expiry_date_display",
+        "remaining_days",
+        "max_clients",
+        "activation_type",
+        "pending_activation_days",
+        "allowed_nodes",
+        "nodes",
+        "enable_wg1",
+        "allowed_wg_instances",
+        "enable_singbox",
+        "allowed_singbox_inbounds",
+        "total_traffic_bytes",
+        "first_connection_at_iso",
+    )
+
+    snapshot = {
+        key: record[key]
+        for key in keys
+        if key in record
+    }
+
+    try:
+        text = json.dumps(snapshot, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return ""
+
+    return text[:limit]
+
 
 
 def get_order_by_id_for_fulfillment(
@@ -5022,7 +5331,53 @@ def ensure_eylan_active_service(order, order_id):
     )
 
 
-def provision_eylan_order_with_api(order):
+def order_field(order, name, default=None):
+    """خواندن امن یک ستون از ردیف سفارش (برای دیتابیس‌های قدیمی‌تر)."""
+
+    try:
+        if name in order.keys():
+            value = order[name]
+            return default if value is None else value
+    except Exception:
+        pass
+
+    return default
+
+
+#: وضعیت‌هایی که یعنی «ربات قبلاً این سفارش را در پنل راستی‌آزمایی کرده است».
+VERIFIED_API_STATUSES = {"verified", "delivered", "message_sent"}
+
+
+def provision_eylan_order_with_api(order, force=False):
+    """
+    ساخت یا تمدید *واقعی* کاربر در EylanPanel و راستی‌آزمایی نتیجه.
+
+    خروجی یک dict است:
+        username            نام کاربری نهایی در پنل
+        link                لینک سابسکریپشن
+        action              'created' | 'renewed' | 'reused'
+        renamed             پنل نام کاربری را عوض کرده است
+        requested_username  نامی که مشتری/ربات خواسته بود
+        verified            آیا با خواندن مجدد از پنل تأیید شد
+        expiry_date         تاریخ انقضای درخواستی (YYYY-MM-DD) یا None
+        reset_traffic       نتیجه‌ی صفرکردن حجم بعد از تمدید
+        notes               نکته‌های قابل نمایش به ادمین
+        panel_record        رکورد کامل کاربر از پنل
+
+    چرا این تابع بازنویسی شد
+    ------------------------
+    نسخه‌ی قبلی دو میان‌بُر داشت که بدون هیچ تماسی با پنل، لینک ذخیره‌شده در
+    دیتابیس را برمی‌گرداندند (وقتی api_status برابر link_ready/delivered/
+    message_sent یا created/updated بود). در آن حالت ربات پیام
+    «✅ سفارش به‌صورت خودکار ساخته و تحویل داده شد» می‌داد در حالی که در پنل
+    هیچ کاربری ساخته یا تمدید نشده بود. حالا:
+
+    * میان‌بُر فقط وقتی استفاده می‌شود که کاربر *همین الان* از پنل خوانده و
+      تأیید شود؛ اگر در پنل وجود نداشته باشد، عملیات از اول انجام می‌شود.
+    * بعد از هر POST/PUT، کاربر دوباره از پنل خوانده می‌شود و حجم/انقضا
+      مقایسه می‌شود. اگر تغییر ننشسته باشد، خطا برمی‌گردد (نه موفقیت).
+    """
+
     product_id = order["product_id"]
     service = service_for_product(product_id)
     if service not in {"wireguard", "v2ray"}:
@@ -5034,44 +5389,108 @@ def provision_eylan_order_with_api(order):
     if not username:
         raise EylanPanelError("نام کاربری سرویس برای این سفارش ثبت نشده است.")
 
-    # If the subscription was already generated, never create a second user.
-    if (
-        order["api_link"]
-        and order["api_status"] in ("link_ready", "delivered", "message_sent")
-        and order["api_username"]
-    ):
-        return order["api_username"], order["api_link"]
-
     client = get_eylan_client()
 
-    # IMPORTANT: if create/update already succeeded but the following request
-    # failed (for example while fetching the subscription URL), do not repeat
-    # the mutation on retry. Re-fetch the link only.
-    persisted_username = (order["api_username"] or "").strip()
-    persisted_status = (order["api_status"] or "").strip()
-    if persisted_username and persisted_status in {"created", "updated"}:
-        link = client.get_subscription_link(persisted_username)
-        save_order_api_state(
-            order["id"],
-            api_username=persisted_username,
-            api_link=link,
-            api_status="link_ready",
-            api_error="",
-            service_username=persisted_username,
-        )
-        return persisted_username, link
+    notes = []
 
-    # For existing users, validate local ownership before touching the remote account.
+    persisted_username = (order_field(order, "api_username") or "").strip()
+    persisted_status = (order_field(order, "api_status") or "").strip()
+    persisted_link = (order_field(order, "api_link") or "").strip()
+    persisted_verified_at = (order_field(order, "api_verified_at") or "").strip()
+
+    # ── میان‌بُر فقط با اثبات زنده بودن اکانت در پنل ──────────────────────────
+    if (
+        not force
+        and persisted_username
+        and persisted_status in VERIFIED_API_STATUSES
+        and persisted_verified_at
+    ):
+        try:
+            remote = client.get_user_status(persisted_username)
+        except EylanPanelError as exc:
+            # هر شکستی در «اثبات زنده بودن اکانت» یعنی نمی‌توانیم به وضعیت
+            # ذخیره‌شده اعتماد کنیم؛ پس به‌جای گزارش موفقیت، عملیات از اول
+            # اجرا می‌شود. (اگر مشکل موقتی باشد، مرحله‌ی بعد خطای روشن می‌دهد.)
+            logger.warning(
+                "Cached delivery state for order #%s could not be confirmed "
+                "on the panel (%s); re-running provisioning.",
+                order["id"], exc
+            )
+            remote = None
+
+        if remote is not None:
+            link = persisted_link or client.get_subscription_link(
+                persisted_username
+            )
+
+            save_order_api_state(
+                order["id"],
+                api_username=persisted_username,
+                api_link=link,
+                api_status="verified",
+                api_error="",
+                api_panel_snapshot=panel_snapshot_json(remote),
+                service_username=persisted_username,
+            )
+
+            return {
+                "username": persisted_username,
+                "link": link,
+                "action": "reused",
+                "renamed": False,
+                "requested_username": username,
+                "verified": True,
+                "expiry_date": None,
+                "reset_traffic": None,
+                "notes": [
+                    "این سفارش قبلاً در پنل ساخته و راستی‌آزمایی شده بود؛ "
+                    "وجود اکانت دوباره از پنل بررسی شد."
+                ],
+                "panel_record": remote,
+            }
+
+        notes.append(
+            "وضعیت ذخیره‌شده «تحویل‌شده» بود ولی اکانت در پنل پیدا نشد؛ "
+            "عملیات از اول انجام شد."
+        )
+
+    # ── خواندن وضعیت فعلی از پنل ──────────────────────────────────────────────
     existing_remote = client.get_user(username)
+
+    # اگر نام کاربری در تلاش قبلی توسط پنل عوض شده بود، همان نام نهایی را
+    # مبنا قرار می‌دهیم تا دوباره اکانت تکراری نسازیم.
+    if (
+        existing_remote is None
+        and persisted_username
+        and persisted_username != username
+    ):
+        existing_remote = client.get_user(persisted_username)
+        if existing_remote is not None:
+            username = persisted_username
+            notes.append(
+                f"اکانت قبلاً با نام نهایی «{username}» در پنل ثبت شده بود."
+            )
+
     if existing_remote is not None:
-        if not local_username_belongs_to_user(
+        # ── تمدید / به‌روزرسانی اکانت موجود ──────────────────────────────────
+        #
+        # اگر همین سفارش قبلاً این اکانت را ساخته باشد (api_username ذخیره
+        # شده)، مالکیت محلی اثبات‌شده است. بدون این استثنا، «تلاش مجدد» روی
+        # سفارشی که یک بار اکانتش ساخته شده همیشه با پیام «متعلق به کاربر
+        # دیگری است» متوقف می‌شد و ادمین راهی برای جلو بردن سفارش نداشت.
+        owned_by_this_order = bool(persisted_username) and (
+            persisted_username == username
+        )
+
+        if not owned_by_this_order and not local_username_belongs_to_user(
             order["user_id"],
             username,
             exclude_order_id=order["id"],
         ):
             raise EylanPanelError(
-                f"نام کاربری {username} از قبل در EylanPanel وجود دارد، اما در دیتابیس این ربات برای این کاربر ثبت نشده است؛ "
-                "برای جلوگیری از دستکاری اکانت شخص دیگر، سفارش متوقف شد."
+                f"نام کاربری {username} از قبل در EylanPanel وجود دارد، اما در "
+                "دیتابیس این ربات برای این کاربر ثبت نشده است؛ برای جلوگیری از "
+                "دستکاری اکانت شخص دیگر، سفارش متوقف شد."
             )
 
         update_payload = eylan_payload_for_product(
@@ -5079,28 +5498,80 @@ def provision_eylan_order_with_api(order):
             username,
             for_update=True,
             client=client,
+            remote=existing_remote,
+            order=order,
         )
+
+        expected_expiry = eylan_expected_expiry_date(update_payload)
+
+        # پنل EylanPanel در PUT فیلد expiry_days را نمی‌پذیرد؛ بدون تاریخ
+        # صریح، تمدید «موفق» گزارش می‌شد ولی تاریخ انقضا تکان نمی‌خورد.
+        if service == "wireguard" and expected_expiry is None:
+            raise EylanPanelError(
+                "payload تمدید بدون تاریخ انقضای صریح (expiry_date_str) ساخته شد. "
+                "پنل EylanPanel در ویرایش کاربر فیلد expiry_days را نادیده "
+                "می‌گیرد، پس تمدید بی‌اثر می‌ماند و ربات عمداً ادامه نمی‌دهد."
+            )
+
         client.update_user(username, update_payload)
         final_username = username
-        save_order_api_state(
-            order["id"],
-            api_username=final_username,
-            api_status="updated",
-        )
+        action = "renewed"
+        renamed = False
+
+        panel_record = existing_remote
+
+        if EYLAN_VERIFY_AFTER_WRITE:
+            panel_record = client.verify_expiry_extended(
+                final_username,
+                expected_date=expected_expiry,
+            )
+
+        # بعد از تمدید، حجم مصرفی صفر و قفل حجم باز می‌شود تا مشتری واقعاً
+        # بتواند از حجم جدید استفاده کند.
+        reset_result = None
+        if EYLAN_RENEWAL_RESET_TRAFFIC:
+            try:
+                client.reset_traffic(final_username)
+                reset_result = "ok"
+                notes.append("حجم مصرفی مشتری در پنل صفر شد.")
+            except EylanPanelError as exc:
+                reset_result = f"failed: {exc}"
+                notes.append(
+                    "هشدار: صفرکردن حجم مصرفی در پنل انجام نشد "
+                    f"({exc}). تمدید تاریخ انجام شده است."
+                )
+
     else:
+        # ── ساخت اکانت تازه ──────────────────────────────────────────────────
         payload = eylan_payload_for_product(
             product_id,
             username,
             for_update=False,
             client=client,
+            order=order,
         )
-        final_username = client.create_user(payload)
-        save_order_api_state(
-            order["id"],
-            api_username=final_username,
-            api_status="created",
-            service_username=final_username,
-        )
+
+        created = client.create_user_ex(payload)
+        final_username = created["username"]
+        action = "created"
+        renamed = bool(created["renamed"])
+        expected_expiry = eylan_expected_expiry_date(payload)
+
+        if renamed:
+            notes.append(
+                f"پنل نام کاربری را از «{username}» به «{final_username}» "
+                "تغییر داد (چون آن نام در سطح پنل قبلاً گرفته شده بود)."
+            )
+
+        if EYLAN_VERIFY_AFTER_WRITE:
+            panel_record = client.verify_user_exists(
+                final_username,
+                expected_data_limit=payload.get("data_limit"),
+            )
+        else:
+            panel_record = client.get_user_status(final_username)
+
+        reset_result = None
 
     link = client.get_subscription_link(final_username)
 
@@ -5108,21 +5579,35 @@ def provision_eylan_order_with_api(order):
         order["id"],
         api_username=final_username,
         api_link=link,
-        api_status="link_ready",
+        api_status="verified",
         api_error="",
+        api_verified_at=now(),
+        api_panel_snapshot=panel_snapshot_json(panel_record),
+        api_renamed_from=(username if renamed else ""),
         service_username=final_username,
     )
 
-    return final_username, link
+    return {
+        "username": final_username,
+        "link": link,
+        "action": action,
+        "renamed": renamed,
+        "requested_username": (order["service_username"] or "").strip(),
+        "verified": bool(EYLAN_VERIFY_AFTER_WRITE),
+        "expiry_date": expected_expiry.isoformat() if expected_expiry else None,
+        "reset_traffic": reset_result,
+        "notes": notes,
+        "panel_record": panel_record,
+    }
 
 
 # Backward-compatible wrappers kept so older internal calls remain safe.
-def provision_wireguard_order_with_api(order):
-    return provision_eylan_order_with_api(order)
+def provision_wireguard_order_with_api(order, force=False):
+    return provision_eylan_order_with_api(order, force=force)
 
 
-def provision_v2ray_order_with_api(order):
-    return provision_eylan_order_with_api(order)
+def provision_v2ray_order_with_api(order, force=False):
+    return provision_eylan_order_with_api(order, force=force)
 
 
 def _save_trial_panel_link(trial_id, panel_link):
@@ -5141,7 +5626,14 @@ def _mark_trial_api_created(trial_id):
         )
 
 
-def provision_wireguard_trial_with_api(trial):
+def provision_wireguard_trial_with_api(trial, force=False):
+    """
+    ساخت/تمدید اکانت تست در پنل + راستی‌آزمایی.
+
+    مثل سفارش‌های عادی، لینک ذخیره‌شده به‌تنهایی کافی نیست: اگر اکانت در پنل
+    وجود نداشته باشد، عملیات از اول اجرا می‌شود تا «تحویل شد» الکی گزارش نشود.
+    """
+
     username = (trial["username"] or "").strip()
 
     if not USERNAME_RE.fullmatch(username):
@@ -5149,11 +5641,23 @@ def provision_wireguard_trial_with_api(trial):
             "نام کاربری اکانت تست باید فقط شامل حروف انگلیسی، عدد، _ یا - باشد."
         )
 
-    if trial["panel_link"]:
-        return username, trial["panel_link"]
-
     trial_id = int(trial["id"])
     client = get_eylan_client()
+
+    cached_link = (trial["panel_link"] or "").strip()
+
+    if cached_link and not force:
+        try:
+            client.require_user(username)
+            return username, cached_link
+        except EylanPanelNotFound:
+            # لینک ذخیره شده ولی اکانت در پنل نیست ⇒ باید دوباره ساخته شود.
+            logger.warning(
+                "Trial %s had a cached panel link but the user is missing "
+                "on the panel; recreating.",
+                trial_id,
+            )
+
     payload = eylan_payload_for_product(
         TRIAL_PRODUCT_ID,
         username,
@@ -5176,17 +5680,32 @@ def provision_wireguard_trial_with_api(trial):
             raise EylanPanelError(
                 f"نام کاربری {username} از قبل در پنل وجود دارد، اما به این کاربر تعلق ندارد."
             )
+
         update_payload = eylan_payload_for_product(
             TRIAL_PRODUCT_ID,
             username,
             for_update=True,
             client=client,
+            remote=existing_remote,
         )
         client.update_user(username, update_payload)
         final_username = username
+
+        if EYLAN_VERIFY_AFTER_WRITE:
+            client.verify_expiry_extended(
+                final_username,
+                expected_date=eylan_expected_expiry_date(update_payload),
+            )
     else:
-        final_username = client.create_user(payload)
+        created = client.create_user_ex(payload)
+        final_username = created["username"]
         _mark_trial_api_created(trial_id)
+
+        if EYLAN_VERIFY_AFTER_WRITE:
+            client.verify_user_exists(
+                final_username,
+                expected_data_limit=payload.get("data_limit"),
+            )
 
     link = client.get_subscription_link(final_username)
     _save_trial_panel_link(trial_id, link)
@@ -5220,7 +5739,78 @@ def _fulfillment_retry_keyboard(order_id):
     return kb
 
 
-def deliver_eylan_order_via_api(admin_id, order_id):
+def panel_record_summary_lines(record):
+    """چند خط کوتاه و خوانا از رکورد کاربر در پنل، برای گزارش به ادمین."""
+
+    if not isinstance(record, dict) or not record:
+        return []
+
+    lines = []
+
+    limit = record.get("data_limit")
+    unit = str(record.get("data_limit_unit") or "GB").upper()
+
+    if limit is not None:
+        if limit in (0, "0", None):
+            lines.append("📶 حجم در پنل: <b>نامحدود</b>")
+        else:
+            lines.append(f"📶 حجم در پنل: <b>{esc(limit)} {esc(unit)}</b>")
+
+    expiry = (
+        record.get("expiry_date_actual_iso")
+        or record.get("expiry_date")
+        or record.get("expiry_date_str")
+        or record.get("expiry_date_display")
+    )
+
+    if expiry:
+        lines.append(
+            f"⏳ انقضای ثبت‌شده در پنل: <b>{esc(jalali_datetime_str(expiry))}</b>"
+        )
+
+    remaining = record.get("remaining_days")
+    if remaining is not None:
+        lines.append(f"📆 روزهای باقی‌مانده از دید پنل: <b>{esc(remaining)}</b>")
+
+    nodes = record.get("allowed_nodes") or record.get("nodes")
+    if isinstance(nodes, list) and nodes:
+        lines.append(f"🌐 نودهای اختصاص‌یافته: <b>{len(nodes)}</b>")
+
+    wg = record.get("allowed_wg_instances")
+    if isinstance(wg, list) and wg:
+        lines.append(
+            f"🔌 اینستنس‌های وایرگارد: <b>{esc(', '.join(str(x) for x in wg))}</b>"
+        )
+
+    if record.get("enable_wg1"):
+        lines.append("🔌 wg1: <b>فعال</b>")
+
+    inbounds = record.get("allowed_singbox_inbounds")
+    if isinstance(inbounds, list) and inbounds:
+        lines.append(
+            f"🛜 اینباند‌های سینگ‌باکس: <b>{esc(', '.join(str(x) for x in inbounds))}</b>"
+        )
+
+    is_active = record.get("is_active")
+    if is_active is not None:
+        lines.append(
+            "🟢 وضعیت کاربر در پنل: <b>فعال</b>"
+            if is_active
+            else "🔴 وضعیت کاربر در پنل: <b>غیرفعال</b>"
+        )
+
+    return lines
+
+
+def deliver_eylan_order_via_api(admin_id, order_id, force=False):
+    """
+    تحویل خودکار سفارش در EylanPanel.
+
+    پیام موفقیت فقط وقتی ارسال می‌شود که کاربر *بعد از* ساخت/تمدید از پنل
+    خوانده و راستی‌آزمایی شده باشد. اگر پنل پاسخ موفق بدهد ولی تغییری
+    اعمال نشده باشد، ادمین خطای روشن + دکمه تلاش مجدد می‌گیرد.
+    """
+
     order = get_order_by_id_for_fulfillment(order_id, admin_id)
     if not order:
         clear_admin_state(admin_id)
@@ -5233,7 +5823,10 @@ def deliver_eylan_order_via_api(admin_id, order_id):
         return False
 
     try:
-        final_username, panel_link = provision_eylan_order_with_api(order)
+        result = provision_eylan_order_with_api(order, force=force)
+        final_username = result["username"]
+        panel_link = result["link"]
+
         order = get_order_by_id_for_fulfillment(order_id, admin_id) or order
 
         # Local state is prepared before the customer receives the link.
@@ -5252,6 +5845,7 @@ def deliver_eylan_order_via_api(admin_id, order_id):
                 order_id,
                 delivery_message_id=existing_message_id,
                 api_status="message_sent",
+                api_verified_at=order_field(order, "api_verified_at") or now(),
             )
             # فایل/کپشن «نحوه اتصال (تحویل)» همزمان با پیام آماده؛ فقط یک بار
             # (در تلاش مجدد بعد از خطا دوباره ارسال نمی‌شود).
@@ -5264,16 +5858,64 @@ def deliver_eylan_order_via_api(admin_id, order_id):
             api_link=panel_link,
             api_status="delivered",
             api_error="",
+            api_verified_at=order_field(order, "api_verified_at") or now(),
             delivery_message_id=existing_message_id,
         )
 
         clear_admin_state(admin_id)
-        label = "WireGuard" if service == "wireguard" else "V2Ray / Sing-box"
+
+        action_label = {
+            "created": "ساخته",
+            "renewed": "تمدید",
+            "reused": "از قبل ساخته شده بود و دوباره در پنل راستی‌آزمایی",
+        }.get(result["action"], result["action"])
+
+        lines = [
+            f"✅ سفارش #{order_id} به‌صورت خودکار {action_label} و تحویل داده شد.",
+            f"🔌 نوع سرویس: <b>WireGuard</b>",
+            f"👤 نام کاربری در پنل: <b>{esc(final_username)}</b>",
+        ]
+
+        if result.get("renamed"):
+            lines.append(
+                "⚠️ پنل نام کاربری را عوض کرد؛ نام درخواستی مشتری "
+                f"<code>{esc(result.get('requested_username') or '')}</code> بود."
+            )
+
+        if result.get("verified"):
+            lines.append(
+                "🛡 راستی‌آزمایی: اکانت بعد از ثبت، از خود پنل دوباره خوانده و تأیید شد."
+            )
+        else:
+            lines.append(
+                "⚠️ راستی‌آزمایی غیرفعال است (EYLAN_VERIFY_AFTER_WRITE=false)."
+            )
+
+        lines += panel_record_summary_lines(result.get("panel_record"))
+
+        for note in result.get("notes") or []:
+            lines.append(f"ℹ️ {esc(note)}")
+
+        bot.send_message(admin_id, "\n".join(lines))
+
+    except EylanPanelVerificationError as exc:
+        logger.error(
+            "EylanPanel verification failed for order #%s: %s", order_id, exc
+        )
+        save_order_api_state(
+            order_id,
+            api_status="failed_verification",
+            api_error=str(exc),
+        )
         bot.send_message(
             admin_id,
-            f"✅ سفارش #{order_id} به‌صورت خودکار ساخته و تحویل داده شد.\n"
-            f"🔌 نوع سرویس: <b>{label}</b>\n"
-            f"👤 نام کاربری: <b>{esc(final_username)}</b>"
+            "⚠️ <b>پنل پاسخ موفق داد، ولی تغییر واقعاً اعمال نشده است.</b>\n\n"
+            f"<code>{esc(str(exc))}</code>\n\n"
+            "ربات عمداً این سفارش را «تحویل‌شده» علامت نزد تا مشتری سرویس نگرفته "
+            "بی‌خبر نماند.\n"
+            "با دکمه زیر دوباره تلاش کنید (تلاش مجدد، عملیات را از صفر روی پنل "
+            "اجرا می‌کند).",
+            reply_markup=_fulfillment_retry_keyboard(order_id),
         )
 
     except EylanPanelError as exc:
@@ -5293,7 +5935,9 @@ def deliver_eylan_order_via_api(admin_id, order_id):
         )
 
     except Exception as exc:
-        logger.exception("Unexpected automatic fulfillment failure for order #%s", order_id)
+        logger.exception(
+            "Unexpected automatic fulfillment failure for order #%s", order_id
+        )
         save_order_api_state(
             order_id,
             api_status="failed",
@@ -5309,12 +5953,12 @@ def deliver_eylan_order_via_api(admin_id, order_id):
     return True
 
 
-def deliver_wireguard_order_via_api(admin_id, order_id):
-    return deliver_eylan_order_via_api(admin_id, order_id)
+def deliver_wireguard_order_via_api(admin_id, order_id, force=False):
+    return deliver_eylan_order_via_api(admin_id, order_id, force=force)
 
 
-def deliver_v2ray_order_via_api(admin_id, order_id):
-    return deliver_eylan_order_via_api(admin_id, order_id)
+def deliver_v2ray_order_via_api(admin_id, order_id, force=False):
+    return deliver_eylan_order_via_api(admin_id, order_id, force=force)
 
 
 def deliver_wireguard_trial_via_api(
@@ -5998,7 +6642,7 @@ def admin_assign_new_gmail(
 
         bot.send_message(
             admin_id,
-            f"✅ جیمیل جدید '{esc(new_gmail)}' برای سرویس #{service_id} ثبت شد."
+            f"✅ جیمیل جدید '{esc(new_gmail)}' برای سرویس {service_code(service_id)} ثبت شد."
         )
 
     except Exception:
@@ -6158,6 +6802,15 @@ def admin_stats_text():
             """
         ).fetchone()[0]
 
+        # سفارش‌هایی که مشتری رها کرده و ربات خودش بسته است.
+        stale_orders = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM orders
+            WHERE status='expired_unpaid'
+            """
+        ).fetchone()[0]
+
         total_sales = conn.execute(
             """
             SELECT COALESCE(
@@ -6289,6 +6942,7 @@ def admin_stats_text():
         f"⏳ سفارش‌های باز: <b>{pending_orders:,}</b>",
         f"❌ سفارش‌های لغوشده: <b>{cancelled_orders:,}</b>",
         f"🚫 سفارش‌های ردشده: <b>{rejected_orders:,}</b>",
+        f"🧹 سفارش‌های نیمه‌تمام (پرداخت‌نشده): <b>{stale_orders:,}</b>",
         "",
         "📦 <b>سرویس‌ها</b>",
         f"🟢 سرویس‌های فعال: <b>{active_services:,}</b>",
@@ -6467,6 +7121,20 @@ def admin_panel_keyboard(admin_id=None, chat_id=None):
         types.InlineKeyboardButton(
             "🛠 خاموش کردن ربات" if not maintenance_on else "✅ روشن کردن ربات",
             callback_data="admin:maintenance_toggle"
+        )
+    )
+
+    # 🔎 جستجوی سفارش: یک ورودی که هم شماره سفارش (#48)، هم شناسه سرویس
+    # (S-46)، هم تست (T-12)، هم نام کاربری پنل، هم آیدی/یوزرنیم تلگرام و هم
+    # جیمیل را پیدا می‌کند و «گزارش کامل» همان مورد را می‌دهد.
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔎 جستجوی سفارش",
+            callback_data="admin:order_search"
+        ),
+        types.InlineKeyboardButton(
+            "🧹 سفارش‌های نیمه‌تمام",
+            callback_data="admin:stale_orders"
         )
     )
 
@@ -6667,7 +7335,7 @@ def admin_trial_quota_text(user_id):
         for row in recent:
             created = (row["created_at"] or "")[:16].replace("T", " ")
             lines.append(
-                f"• <code>#{row['id']}</code> — <b>{esc(row['username'])}</b> — "
+                f"• <code>{trial_code(row['id'])}</code> — <b>{esc(row['username'])}</b> — """  # noqa: E501
                 f"{status_labels.get(row['status'], esc(row['status']))} — {esc(created)}"
             )
     return "\n".join(lines)
@@ -6741,6 +7409,10 @@ def eylan_admin_dashboard_keyboard():
             callback_data="admin:eylan"
         ),
         types.InlineKeyboardButton(
+            "🩺 عیب‌یابی اتصال و مجوزها",
+            callback_data="admin:eylan:diag"
+        ),
+        types.InlineKeyboardButton(
             "📋 سرویس‌های ثبت‌شده در ربات",
             callback_data="admin:eylan:local"
         ),
@@ -6754,6 +7426,259 @@ def eylan_admin_dashboard_keyboard():
         )
     )
     return kb
+
+
+def eylan_diagnostic_text():
+    """
+    🩺 عیب‌یابی کامل اتصال به EylanPanel.
+
+    این گزارش دقیقاً همان چیزی را نشان می‌دهد که موقع «ساخت خودکار» لازم است:
+    اینکه کلید API به کدام دامنه می‌خورد، پنل چه منابعی (نود / وایرگارد /
+    سینگ‌باکس) را به این کلید اجازه داده است، و payload واقعی که ربات برای یک
+    محصول نمونه می‌فرستد چیست. با یک نگاه می‌شود فهمید چرا کاربری در پنل
+    ساخته نمی‌شود.
+    """
+
+    lines = [
+        "🩺 <b>عیب‌یابی اتصال EylanPanel</b>",
+        "━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if not EYLAN_API_KEY:
+        lines.append(
+            "🔴 <b>EYLAN_API_KEY تنظیم نشده است.</b>\n"
+            "تا وقتی کلید API در Environment سرویس قرار نگیرد و ربات "
+            "ریستارت نشود، هیچ ساخت/تمدیدی در پنل انجام نمی‌شود."
+        )
+        return "\n".join(lines)
+
+    try:
+        client = get_eylan_client()
+    except Exception as exc:
+        lines.append(f"🔴 کلاینت ساخته نشد: <code>{esc(exc)}</code>")
+        return "\n".join(lines)
+
+    config = client.describe_configuration()
+
+    lines.append("🌐 <b>دامنه‌های پیکربندی‌شده</b>")
+    for url in config["base_urls_tried"]:
+        lines.append(f"   • <code>{esc(url)}</code>")
+    lines.append(
+        f"   ⏱ timeout={config['timeout']}s | "
+        f"allow_http={config['allow_http']}"
+    )
+    lines.append("")
+
+    # ── ۱) سلامت پنل ────────────────────────────────────────────────────────
+    try:
+        status = client.status()
+        state = (
+            status.get("status")
+            or status.get("message")
+            or "پاسخ سالم"
+        )
+        version = status.get("version") or status.get("panel_version")
+        lines.append(
+            "✅ <b>/api/v1/status</b> → "
+            f"<code>{esc(state)}</code>"
+            + (f" | نسخه <code>{esc(version)}</code>" if version else "")
+        )
+    except Exception as exc:
+        lines.append(f"🔴 <b>/api/v1/status</b> → <code>{esc(exc)}</code>")
+    lines.append("")
+
+    # ── ۲) منابع مجاز برای همین کلید API ────────────────────────────────────
+    resources = {}
+    try:
+        resources = client.allowed_resources()
+        lines.append("✅ <b>/api/v1/users/stats</b> → allowed_resources دریافت شد")
+    except Exception as exc:
+        lines.append(
+            f"⚠️ <b>/api/v1/users/stats</b> → <code>{esc(exc)}</code>\n"
+            "   (بدون این endpoint نمی‌شود فهمید کدام نود/وایرگارد مجاز است)"
+        )
+
+    allowed_nodes = resources.get("nodes") if isinstance(resources, dict) else None
+    allowed_wg = resources.get("wg_instances") if isinstance(resources, dict) else None
+    allowed_sb = resources.get("singbox_inbounds") if isinstance(resources, dict) else None
+
+    # ── ۳) نودها ────────────────────────────────────────────────────────────
+    try:
+        nodes = client.get_nodes()
+        lines.append(f"✅ <b>/api/v1/nodes</b> → {len(nodes)} نود")
+
+        name_to_id = {}
+        for node in nodes:
+            node_id = node.get("id")
+            name = str(node.get("name") or "").strip()
+            if node_id is not None and name:
+                name_to_id[name.casefold()] = node_id
+            lines.append(
+                f"   • <code>{esc(name or '—')}</code> (id={esc(node_id)})"
+            )
+
+        missing = [
+            name for name in EYLAN_REQUIRED_NODE_NAMES
+            if name.strip().casefold() not in name_to_id
+        ]
+
+        if missing:
+            lines.append(
+                "🔴 این نودهای لازم برای کلید API پیدا نشد: "
+                f"<b>{esc(', '.join(missing))}</b>\n"
+                "   تا وقتی این‌ها دیده نشوند، ساخت خودکار عمداً متوقف می‌شود "
+                "(EYLAN_REQUIRED_NODE_NAMES را با نام‌های بالا یکسان کنید)."
+            )
+        else:
+            resolved = [
+                name_to_id[name.strip().casefold()]
+                for name in EYLAN_REQUIRED_NODE_NAMES
+                if name.strip().casefold() in name_to_id
+            ]
+            lines.append(
+                "✅ همه‌ی نودهای لازم دیده می‌شوند → "
+                f"<code>{esc(resolved)}</code>"
+            )
+
+        if isinstance(allowed_nodes, list):
+            allowed_ids = {
+                item.get("id")
+                for item in allowed_nodes
+                if isinstance(item, dict)
+            }
+            not_allowed = [nid for nid in resolved if nid not in allowed_ids]
+            if not_allowed:
+                lines.append(
+                    "🔴 این نودها در nodes دیده می‌شوند ولی برای کلید API شما "
+                    f"<b>مجاز نیستند</b>: <code>{esc(not_allowed)}</code>\n"
+                    "   پنل چنین کاربری را با این نودها نمی‌سازد."
+                )
+    except Exception as exc:
+        lines.append(f"🔴 <b>/api/v1/nodes</b> → <code>{esc(exc)}</code>")
+    lines.append("")
+
+    # ── ۴) اینستنس‌های وایرگارد ─────────────────────────────────────────────
+    wanted_wg = eylan_wg_instance_names()
+    try:
+        instances = client.get_my_wireguard_instances()
+        names = [
+            str(item.get("name") or item.get("instance") or "").strip()
+            for item in instances
+        ]
+        names = [n for n in names if n]
+        lines.append(
+            f"✅ <b>/api/v1/public/wireguard/my_instances</b> → "
+            f"{len(names)} مورد: <code>{esc(', '.join(names) or '—')}</code>"
+        )
+
+        missing_wg = [w for w in wanted_wg if w not in names]
+        if wanted_wg and missing_wg:
+            lines.append(
+                "🔴 این اینستنس‌های وایرگارد برای کلید API مجاز نیستند: "
+                f"<b>{esc(', '.join(missing_wg))}</b>\n"
+                "   ربات آن‌ها را داخل فیلد wg_instances می‌فرستد و پنل رد "
+                "می‌کند. یا در پنل دسترسی بدهید یا EYLAN_WG_INTERFACES را "
+                f"به <code>{esc(','.join(['wg1'] + names))}</code> تغییر دهید."
+            )
+        elif wanted_wg:
+            lines.append(
+                "✅ همه‌ی اینستنس‌های لازم مجاز هستند → "
+                f"<code>{esc(', '.join(wanted_wg))}</code>"
+            )
+    except Exception as exc:
+        lines.append(
+            f"⚠️ <b>/api/v1/public/wireguard/my_instances</b> → "
+            f"<code>{esc(exc)}</code>"
+        )
+
+    if isinstance(allowed_wg, list) and allowed_wg:
+        allowed_names = [
+            str(item.get("name") or "").strip()
+            for item in allowed_wg
+            if isinstance(item, dict)
+        ]
+        lines.append(
+            f"   allowed_wg_instances از stats: "
+            f"<code>{esc(', '.join(n for n in allowed_names if n) or '—')}</code>"
+        )
+    lines.append("")
+
+    # ── ۵) اینباندهای سینگ‌باکس ─────────────────────────────────────────────
+    try:
+        inbounds = client.get_singbox_inbounds()
+        tags = [
+            str(item.get("tag") or "").strip()
+            for item in inbounds
+            if str(item.get("tag") or "").strip()
+        ]
+        lines.append(
+            f"✅ <b>/api/v1/public/singbox/my_inbounds</b> → "
+            f"{len(tags)} inbound: <code>{esc(', '.join(tags) or '—')}</code>"
+        )
+        if not tags:
+            lines.append(
+                "⚠️ برای این کلید هیچ inbound سینگ‌باکسی مجاز نیست؛ "
+                "تحویل خودکار V2Ray امکان‌پذیر نیست."
+            )
+    except Exception as exc:
+        lines.append(
+            f"⚠️ <b>/api/v1/public/singbox/my_inbounds</b> → "
+            f"<code>{esc(exc)}</code>"
+        )
+    lines.append("")
+
+    # ── ۶) payload واقعی برای یک محصول نمونه ────────────────────────────────
+    sample_product = "wireguard-50gb-1m"
+    if sample_product in EYLAN_PLANS:
+        try:
+            payload = eylan_payload_for_product(
+                sample_product,
+                "diag_sample_user",
+                for_update=False,
+                client=client,
+            )
+            lines.append(
+                f"📦 <b>نمونه payload ساخت کاربر</b> ({esc(sample_product)}):"
+            )
+            for key in sorted(payload):
+                value = payload[key]
+                if isinstance(value, list):
+                    value = json.dumps(value, ensure_ascii=False)
+                lines.append(f"   <code>{esc(key)}={esc(value)}</code>")
+        except Exception as exc:
+            lines.append(
+                f"🔴 ساخت payload نمونه ناموفق بود: <code>{esc(exc)}</code>"
+            )
+        lines.append("")
+
+    # ── ۷) آخرین خطای ذخیره‌شده ─────────────────────────────────────────────
+    with db() as conn:
+        last_failure = conn.execute(
+            """
+            SELECT id, api_status, api_error, updated_at
+            FROM orders
+            WHERE api_error IS NOT NULL
+            AND TRIM(api_error) <> ''
+            ORDER BY COALESCE(updated_at, created_at) DESC
+            LIMIT 1
+            """
+        ).fetchone()
+
+    if last_failure:
+        lines.append("🧾 <b>آخرین خطای ثبت‌شده روی سفارش‌ها</b>")
+        lines.append(
+            f"   سفارش #{last_failure['id']} — "
+            f"{esc(last_failure['api_status'] or '—')} — "
+            f"{esc(jalali_datetime_str(last_failure['updated_at']))}"
+        )
+        lines.append(
+            f"   <code>{esc(str(last_failure['api_error'])[:400])}</code>"
+        )
+
+    text = "\n".join(lines)
+
+    # تلگرام حداکثر ۴۰۹۶ کاراکتر در هر پیام اجازه می‌دهد.
+    return text[:4000]
 
 
 def eylan_local_services_text():
@@ -6779,12 +7704,15 @@ def eylan_local_services_text():
         username = row["service_username"] or "ثبت‌نشده"
         expires = (row["expires_at"] or "بدون تاریخ انقضا")[:16].replace("T", " ")
         lines.append(
-            f"<b>#{row['id']} {esc(label)}</b> — کاربر <code>{row['user_id']}</code> ({esc(telegram_name)})\n"
+            f"<b>{service_code(row['id'])} {esc(label)}</b> — کاربر <code>{row['user_id']}</code> ({esc(telegram_name)})\n"
+            f"{service_origin_label(row)}: <b>{service_origin_code(row)}</b>\n"
             f"نام کاربری سرویس: <code>{esc(username)}</code>\n"
             f"محصول: {esc(row['product_title'])}\n"
             f"شروع: {esc((row['started_at'] or '')[:16].replace('T', ' '))} — انقضا: {esc(expires)}"
         )
         lines.append("")
+
+    lines.append(ID_LEGEND)
     return "\n".join(lines).strip()
 
 
@@ -6941,9 +7869,12 @@ def orders_text(limit=30):
     with db() as conn:
         rows = conn.execute(
             """
-            SELECT *
-            FROM orders
-            ORDER BY id DESC
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            ORDER BY o.id DESC
             LIMIT ?
             """,
             (limit,)
@@ -6952,17 +7883,6 @@ def orders_text(limit=30):
     if not rows:
         return "📦 هیچ سفارشی ثبت نشده است."
 
-    status_map = {
-        "awaiting_payment": "در انتظار پرداخت",
-        "awaiting_receipt": "منتظر فیش",
-        "receipt_submitted": "فیش ارسال شده",
-        "paid_pending_fulfillment": "آماده تحویل",
-        "fulfilling": "در حال تحویل",
-        "completed": "تکمیل شده",
-        "rejected": "رد شده",
-        "cancelled": "لغو شده"
-    }
-
     lines = [
         "📦 <b>آخرین سفارش‌ها</b>",
         ""
@@ -6970,13 +7890,18 @@ def orders_text(limit=30):
 
     for r in rows:
 
+        # شماره‌ی سفارش با «#» نوشته می‌شود؛ شناسه‌ی سرویس با «S-» و اکانت
+        # تست با «T-». این قالب‌ها عمداً متفاوت‌اند تا شماره‌ها قاطی نشوند.
         lines.append(
-            f"#{r['id']} | "
-            f"{r['user_id']} | "
+            f"{order_code(r['id'])} | "
+            f"{esc(_akhavan_user_label(r) or r['user_id'])} | "
             f"{esc(r['product_title'])}\n"
             f"💰 {money(r['price'])} | "
-            f"{status_map.get(r['status'], r['status'])}"
+            f"{ORDER_DATES_STATUS_LABELS.get(r['status'], esc(r['status']))}"
         )
+
+    lines.append("")
+    lines.append(ID_LEGEND)
 
     return "\n".join(lines)
 
@@ -8137,7 +9062,8 @@ def format_service_card(svc):
 
     lines = [
         f"<b>{label}</b> {status_tag}",
-        f"🆔 شناسه سرویس: <b>#{svc['id']}</b>"
+        f"🆔 شناسه سرویس: <b>{service_code(svc['id'])}</b>\n"
+        f"🧾 {service_origin_label(svc)}: <b>{service_origin_code(svc)}</b>"
     ]
 
     if stype == TRIAL_SERVICE_TYPE:
@@ -8321,7 +9247,7 @@ def show_server_status_menu(chat_id, user_id):
     for svc in services:
         kb.add(
             types.InlineKeyboardButton(
-                f"{service_type_label(svc)} — #{svc['id']}",
+                f"{service_type_label(svc)} — {service_code(svc['id'])}",
                 callback_data=f"server_status:{svc['id']}"
             )
         )
@@ -10541,7 +11467,7 @@ def cb_admin_new_gmail(call):
 
     bot.send_message(
         call.from_user.id,
-        f"📧 جیمیل جدید برای سرویس #{service_id} را وارد کنید:"
+        f"📧 جیمیل جدید برای سرویس {service_code(service_id)} را وارد کنید:"
     )
 
 
@@ -11762,9 +12688,18 @@ def cb_fulfill_retry(call):
         "تلاش مجدد شروع شد..."
     )
 
+    bot.send_message(
+        call.from_user.id,
+        f"⚙️ تلاش مجدد سفارش #{order_id}: عملیات مستقیماً روی EylanPanel "
+        "از اول اجرا و سپس راستی‌آزمایی می‌شود..."
+    )
+
+    # force=True ⇒ هیچ میان‌بُری روی وضعیت ذخیره‌شده زده نمی‌شود و ساخت/تمدید
+    # واقعاً دوباره روی پنل اجرا می‌شود.
     deliver_eylan_order_via_api(
         call.from_user.id,
-        order_id
+        order_id,
+        force=True
     )
 
 
@@ -12100,6 +13035,45 @@ def cb_admin_eylan_local(call):
     )
     bot.answer_callback_query(call.id)
     edit_or_send(call, eylan_local_services_text(), kb)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:eylan:diag"
+)
+def cb_admin_eylan_diag(call):
+    """🩺 عیب‌یابی اتصال: یک گزارش کامل از پیکربندی و مجوزهای کلید API."""
+
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+
+    bot.answer_callback_query(call.id, "در حال بررسی اتصال به پنل...")
+
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔄 اجرای دوباره‌ی عیب‌یابی",
+            callback_data="admin:eylan:diag"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به مدیریت EylanPanel",
+            callback_data="admin:eylan"
+        ),
+        types.InlineKeyboardButton(
+            "🏠 پنل مدیریت",
+            callback_data="admin:home"
+        )
+    )
+
+    try:
+        text = eylan_diagnostic_text()
+    except Exception as exc:
+        logger.exception("EylanPanel diagnostic failed")
+        text = f"🔴 عیب‌یابی با خطا مواجه شد:\n<code>{esc(exc)}</code>"
+
+    edit_or_send(call, text, kb)
 
 
 @bot.callback_query_handler(
@@ -16254,7 +17228,8 @@ def order_dates_report(order_id, now_dt=None):
 
     if order.get("renewal_for_service"):
         lines.append(
-            f"🔄 این سفارش تمدید سرویس #{order['renewal_for_service']} است."
+            f"🔄 این سفارش تمدید سرویس "
+            f"{service_code(order['renewal_for_service'])} است."
         )
 
     lines.append(f"💰 مبلغ: {money(order['price'])}")
@@ -16326,10 +17301,19 @@ def order_dates_report(order_id, now_dt=None):
     return "\n".join(lines)
 
 
-def order_dates_result_keyboard():
+def order_dates_result_keyboard(order_id=None):
     kb = types.InlineKeyboardMarkup(
         row_width=1
     )
+
+    # دسترسی یک‌کلیکی به گزارش کامل همان سفارش (همه‌ی اطلاعات موجود).
+    if order_id is not None:
+        kb.add(
+            types.InlineKeyboardButton(
+                f"📦 گزارش کامل {order_code(order_id)}",
+                callback_data=f"admin:dossier:o:{int(order_id)}"
+            )
+        )
 
     kb.add(
         types.InlineKeyboardButton(
@@ -16379,8 +17363,13 @@ def cb_admin_order_dates(call):
     edit_or_send(
         call,
         "📅 <b>تاریخ سفارشات</b>\n\n"
-        "شماره‌ی سفارش را بفرستید (فقط عدد، مثلاً <code>20</code>).\n"
+        "شماره‌ی سفارش را بفرستید (مثلاً <code>20</code> یا <code>#20</code>).\n"
         "تاریخ شمسی ثبت و تحویل سفارش و زمان باقی‌مانده‌ی بازه‌ی یک‌ماهه نمایش داده می‌شود.\n\n"
+        + ID_LEGEND
+        + "\n\n"
+        "اگر دنبال <b>همه‌ی اطلاعات</b> یک سفارش هستید (مشتری، جیمیل، نام "
+        "کاربری پنل، لینک، فیش، تراکنش‌ها و زمان باقی‌مانده) از "
+        "«🔎 جستجوی سفارش» در پنل استفاده کنید.\n\n"
         "برای لغو /cancel بفرستید.",
         kb
     )
@@ -16396,22 +17385,67 @@ def handle_order_dates_message(message):
         )
         return
 
-    order_id = parse_order_number(message.text)
+    text = (message.text or "").strip()
+
+    kind, value = parse_admin_reference(text)
+
+    # اگر ادمین صریحاً شناسه‌ی سرویس یا تست فرستاد، دیگر وانمود نمی‌کنیم که
+    # شماره‌ی سفارش است؛ مستقیم گزارش کامل همان سرویس/تست را می‌دهیم.
+    if kind in {"service", "trial"} and isinstance(value, int):
+        clear_admin_state(admin_id)
+        show_admin_dossier(message.chat.id, kind, value)
+        return
+
+    order_id = (
+        value if (kind in {None, "order"} and isinstance(value, int))
+        else parse_order_number(text)
+    )
 
     if order_id is None:
+        # شاید نام کاربری پنل، @یوزرنیم یا جیمیل فرستاده است.
+        candidates = resolve_admin_reference(text)
+
+        if candidates:
+            bot.send_message(
+                message.chat.id,
+                "🔎 این متن شماره‌ی سفارش نبود، ولی این موارد پیدا شد؛ "
+                "مورد درست را انتخاب کنید:\n\n"
+                + "\n".join(candidate_list_lines(candidates)),
+                reply_markup=candidates_keyboard(candidates)
+            )
+            return
+
         bot.send_message(
             message.chat.id,
-            "❌ شماره‌ی سفارش نامعتبر است. فقط عدد بفرستید (مثلاً 20) یا /cancel بزنید."
+            "❌ شماره‌ی سفارش نامعتبر است. فقط عدد بفرستید (مثلاً 20) یا /cancel بزنید.\n\n"
+            + ID_LEGEND
         )
         return
 
     report = order_dates_report(order_id)
 
     if report is None:
+        # عدد به سفارش نمی‌خورد؛ شاید شناسه‌ی سرویس یا تست بوده است.
+        candidates = resolve_admin_reference(str(order_id))
+
+        if candidates:
+            clear_admin_state(admin_id)
+
+            bot.send_message(
+                message.chat.id,
+                f"⚠️ سفارشی با شماره‌ی {order_code(order_id)} وجود ندارد، "
+                "ولی این عدد به مورد/موارد زیر می‌خورد:\n\n"
+                + "\n".join(candidate_list_lines(candidates))
+                + "\n\n" + ID_LEGEND,
+                reply_markup=candidates_keyboard(candidates)
+            )
+            return
+
         bot.send_message(
             message.chat.id,
-            f"❌ سفارشی با شماره‌ی #{order_id} پیدا نشد. "
-            "شماره‌ی دیگری بفرستید یا /cancel بزنید."
+            f"❌ سفارشی با شماره‌ی {order_code(order_id)} پیدا نشد. "
+            "شماره‌ی دیگری بفرستید یا /cancel بزنید.\n\n"
+            + ID_LEGEND
         )
         return
 
@@ -16420,8 +17454,1663 @@ def handle_order_dates_message(message):
     bot.send_message(
         message.chat.id,
         report,
-        reply_markup=order_dates_result_keyboard()
+        reply_markup=order_dates_result_keyboard(order_id)
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 🔎 جستجوی جهانی سفارش / سرویس / تست + گزارش کامل یک سفارش
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# چرا این بخش اضافه شد؟
+# مشتری در «فاکتور» شماره‌ی سفارش را به شکل «#48» می‌بیند و در «سرویس‌های من»
+# شناسه‌ی سرویس را. این دو از دو جدول متفاوت می‌آیند و عددشان هیچ ربطی به هم
+# ندارد. وقتی مشتری می‌گفت «سفارش من #48 است» و ادمین ۴۸ را جستجو می‌کرد،
+# یک سفارش کاملاً متفاوت (محصول/مشتری دیگر) برمی‌گشت.
+#
+# راه‌حل:
+#   ۱) شناسه‌ها قالب متمایز گرفتند: #48/ORD-48 سفارش، S-46 سرویس، T-12 تست.
+#   ۲) یک جستجوی جهانی که یک عدد را هم‌زمان در هر سه جدول (به‌علاوه‌ی نام
+#      کاربری پنل، آیدی عددی تلگرام، @یوزرنیم و جیمیل) پیدا می‌کند.
+#   ۳) اگر چند نتیجه وجود داشته باشد، هرگز حدس نمی‌زنیم؛ فهرست ابهام‌زدایی با
+#      دکمه نشان می‌دهیم تا ادمین خودش انتخاب کند.
+#   ۴) برای هر نتیجه یک «گزارش کامل» با تمام اطلاعات موجود تولید می‌شود.
+
+#: پیشوندهایی که ادمین می‌تواند صریح بنویسد تا ابهامی نماند.
+REFERENCE_PREFIXES = (
+    ("order", ("ord-", "ord", "order", "سفارش", "سفارشات", "فاکتور", "#")),
+    ("service", ("s-", "svc-", "service", "سرویس", "سرویس‌ها")),
+    ("trial", ("t-", "trial", "تست", "اکانت تست")),
+    ("user", ("u-", "user", "کاربر", "مشتری", "@")),
+)
+
+GMAIL_RE = re.compile(r"^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$")
+
+
+def parse_admin_reference(text):
+    """
+    ورودی آزاد ادمین → (نوع صریح یا None, مقدار).
+
+    «۴۸»، «#48»، «ORD-48»، «سفارش ۴۸»       → ("order" یا None, 48)
+    «S-46»، «سرویس ۴۶»                       → ("service", 46)
+    «T-12»، «تست ۱۲»                         → ("trial", 12)
+    «@buyer»، «312059108» (آیدی عددی تلگرام) → ("user", ...)
+    «myvpn_user» (نام کاربری پنل)            → (None, متن)
+    «a@gmail.com»                            → ("gmail", ...)
+    """
+
+    raw = str(text or "").strip()
+    if not raw:
+        return None, None
+
+    normalized = raw.translate(_ORDER_NUMBER_DIGITS)
+    lowered = normalized.lower()
+
+    # جیمیل
+    candidate = lowered.replace(" ", "")
+    if GMAIL_RE.match(candidate):
+        return "gmail", candidate
+
+    # پیشوند صریح
+    explicit_kind = None
+    body = normalized
+
+    for kind, prefixes in REFERENCE_PREFIXES:
+        for prefix in prefixes:
+            if lowered.startswith(prefix) and len(lowered) > len(prefix):
+                explicit_kind = kind
+                body = normalized[len(prefix):]
+                break
+        if explicit_kind:
+            break
+
+    body = body.strip().strip("-–:：#").strip()
+
+    match = re.search(r"\d{1,18}", body)
+
+    if match and (explicit_kind or body.isdigit() or re.fullmatch(r"#?\s*\d{1,18}", body)):
+        return explicit_kind, int(match.group())
+
+    # @یوزرنیم تلگرام
+    if normalized.startswith("@"):
+        return "user", normalized[1:].strip()
+
+    # متن آزاد (نام کاربری پنل یا یوزرنیم تلگرام بدون @)
+    return None, normalized.strip()
+
+
+def _reference_candidates_by_number(kind, number):
+    """همه‌ی نتایج ممکن برای یک عدد، در جدول‌های مختلف."""
+
+    candidates = []
+
+    with db() as conn:
+        if kind in (None, "order"):
+            row = conn.execute(
+                """
+                SELECT o.*, u.username AS username, u.first_name AS first_name
+                FROM orders o
+                LEFT JOIN users u ON u.user_id = o.user_id
+                WHERE o.id=?
+                """,
+                (number,)
+            ).fetchone()
+
+            if row:
+                candidates.append(_candidate_from_order(row))
+
+        if kind in (None, "service"):
+            row = conn.execute(
+                """
+                SELECT s.*, u.username AS username, u.first_name AS first_name
+                FROM active_services s
+                LEFT JOIN users u ON u.user_id = s.user_id
+                WHERE s.id=?
+                """,
+                (number,)
+            ).fetchone()
+
+            if row:
+                candidates.append(_candidate_from_service(row))
+
+        if kind in (None, "trial"):
+            row = conn.execute(
+                """
+                SELECT t.*, u.username AS username, u.first_name AS first_name
+                FROM wireguard_trials t
+                LEFT JOIN users u ON u.user_id = t.user_id
+                WHERE t.id=?
+                """,
+                (number,)
+            ).fetchone()
+
+            if row:
+                candidates.append(_candidate_from_trial(row))
+
+    return candidates
+
+
+def _candidate_from_order(row):
+    return {
+        "kind": "order",
+        "id": int(row["id"]),
+        "code": order_code(row["id"]),
+        "title": row["product_title"] or "",
+        "user_id": row["user_id"],
+        "label": _akhavan_user_label(row),
+        "status": ORDER_DATES_STATUS_LABELS.get(
+            row["status"], row["status"] or ""
+        ),
+        "callback": f"admin:dossier:o:{int(row['id'])}",
+        "row": dict(row),
+    }
+
+
+def _candidate_from_service(row):
+    return {
+        "kind": "service",
+        "id": int(row["id"]),
+        "code": service_code(row["id"]),
+        "title": row["product_title"] or "",
+        "user_id": row["user_id"],
+        "label": _akhavan_user_label(row),
+        "status": (
+            "منقضی" if row["is_expired"] else "فعال"
+        ),
+        "callback": f"admin:dossier:s:{int(row['id'])}",
+        "row": dict(row),
+    }
+
+
+def _candidate_from_trial(row):
+    return {
+        "kind": "trial",
+        "id": int(row["id"]),
+        "code": trial_code(row["id"]),
+        "title": TRIAL_PRODUCT_TITLE,
+        "user_id": row["user_id"],
+        "label": _akhavan_user_label(row),
+        "status": str(row["status"] or ""),
+        "callback": f"admin:dossier:t:{int(row['id'])}",
+        "row": dict(row),
+    }
+
+
+def _candidates_by_text(value):
+    """جستجو با نام کاربری پنل، @یوزرنیم تلگرام، آیدی عددی یا جیمیل."""
+
+    candidates = []
+    text = str(value or "").strip()
+
+    if not text:
+        return candidates
+
+    like = f"%{text.replace('%', '').replace('_', '_')}%"
+
+    with db() as conn:
+        # آیدی عددی تلگرام مشتری (هر طولی؛ شماره‌های قدیمی کوتاه‌اند)
+        if text.lstrip("@").isdigit():
+            user_id = int(text.lstrip("@"))
+
+            for row in conn.execute(
+                """
+                SELECT o.*, u.username AS username, u.first_name AS first_name
+                FROM orders o
+                LEFT JOIN users u ON u.user_id = o.user_id
+                WHERE o.user_id=?
+                ORDER BY o.id DESC
+                LIMIT 3
+                """,
+                (user_id,)
+            ).fetchall():
+                candidates.append(_candidate_from_order(row))
+
+            for row in conn.execute(
+                """
+                SELECT s.*, u.username AS username, u.first_name AS first_name
+                FROM active_services s
+                LEFT JOIN users u ON u.user_id = s.user_id
+                WHERE s.user_id=?
+                ORDER BY s.id DESC
+                LIMIT 2
+                """,
+                (user_id,)
+            ).fetchall():
+                candidates.append(_candidate_from_service(row))
+
+            return candidates
+
+        name = text.lstrip("@")
+
+        # نام کاربری سرویس در پنل
+        for row in conn.execute(
+            """
+            SELECT o.*, u.username AS username, u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE o.service_username LIKE ?
+            ORDER BY o.id DESC
+            LIMIT 3
+            """,
+            (like,)
+        ).fetchall():
+            candidates.append(_candidate_from_order(row))
+
+        for row in conn.execute(
+            """
+            SELECT s.*, u.username AS username, u.first_name AS first_name
+            FROM active_services s
+            LEFT JOIN users u ON u.user_id = s.user_id
+            WHERE s.service_username LIKE ?
+            ORDER BY s.id DESC
+            LIMIT 3
+            """,
+            (like,)
+        ).fetchall():
+            candidates.append(_candidate_from_service(row))
+
+        for row in conn.execute(
+            """
+            SELECT t.*, u.username AS username, u.first_name AS first_name
+            FROM wireguard_trials t
+            LEFT JOIN users u ON u.user_id = t.user_id
+            WHERE t.username LIKE ?
+            ORDER BY t.id DESC
+            LIMIT 2
+            """,
+            (like,)
+        ).fetchall():
+            candidates.append(_candidate_from_trial(row))
+
+        # جیمیل ثبت‌شده روی سفارش یا سرویس
+        if "@" in text:
+            for row in conn.execute(
+                """
+                SELECT o.*, u.username AS username, u.first_name AS first_name
+                FROM orders o
+                LEFT JOIN users u ON u.user_id = o.user_id
+                WHERE lower(o.gmail_address)=lower(?)
+                ORDER BY o.id DESC
+                LIMIT 3
+                """,
+                (text,)
+            ).fetchall():
+                candidates.append(_candidate_from_order(row))
+
+            for row in conn.execute(
+                """
+                SELECT s.*, u.username AS username, u.first_name AS first_name
+                FROM active_services s
+                LEFT JOIN users u ON u.user_id = s.user_id
+                WHERE lower(s.gmail_address)=lower(?)
+                ORDER BY s.id DESC
+                LIMIT 2
+                """,
+                (text,)
+            ).fetchall():
+                candidates.append(_candidate_from_service(row))
+
+        # @یوزرنیم تلگرام
+        if re.fullmatch(r"[A-Za-z0-9_]{3,64}", name):
+            user = conn.execute(
+                """
+                SELECT user_id
+                FROM users
+                WHERE lower(username)=lower(?)
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (name,)
+            ).fetchone()
+
+            if user:
+                for row in conn.execute(
+                    """
+                    SELECT o.*, u.username AS username,
+                           u.first_name AS first_name
+                    FROM orders o
+                    LEFT JOIN users u ON u.user_id = o.user_id
+                    WHERE o.user_id=?
+                    ORDER BY o.id DESC
+                    LIMIT 3
+                    """,
+                    (int(user["user_id"]),)
+                ).fetchall():
+                    candidates.append(_candidate_from_order(row))
+
+    return candidates
+
+
+def _dedupe_candidates(candidates):
+    seen = set()
+    unique = []
+
+    for item in candidates:
+        key = (item["kind"], item["id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+
+    order_rank = {"order": 0, "service": 1, "trial": 2}
+    unique.sort(key=lambda c: (order_rank.get(c["kind"], 9), -c["id"]))
+
+    return unique
+
+
+def resolve_admin_reference(text):
+    """
+    هر چیزی که ادمین می‌فرستد → فهرست کاندیدها (هرگز حدس تکی نمی‌زنیم).
+    """
+
+    kind, value = parse_admin_reference(text)
+
+    if value is None:
+        return []
+
+    if kind == "gmail":
+        return _dedupe_candidates(_candidates_by_text(value))
+
+    if isinstance(value, int):
+        candidates = _reference_candidates_by_number(kind, value)
+
+        if kind == "user":
+            candidates += _candidates_by_text(str(value))
+
+        # اگر ادمین فقط یک عدد فرستاد، همان عدد را به‌عنوان آیدی تلگرام و
+        # نام کاربری پنل هم بررسی می‌کنیم تا چیزی از قلم نیفتد.
+        if kind is None:
+            candidates += _candidates_by_text(str(value))
+
+        return _dedupe_candidates(candidates)
+
+    if kind == "user":
+        return _dedupe_candidates(_candidates_by_text(str(value)))
+
+    return _dedupe_candidates(_candidates_by_text(str(value)))
+
+
+def reference_search_hint():
+    return (
+        "🔎 <b>جستجوی سفارش / سرویس</b>\n\n"
+        "هرکدام از این‌ها را می‌توانید بفرستید:\n"
+        "   • شماره‌ی سفارش: <code>48</code> یا <code>#48</code> یا <code>ORD-48</code>\n"
+        "   • شناسه‌ی سرویس: <code>S-46</code>\n"
+        "   • شناسه‌ی اکانت تست: <code>T-12</code>\n"
+        "   • نام کاربری سرویس در پنل: <code>myvpn_user</code>\n"
+        "   • آیدی عددی یا @یوزرنیم تلگرام مشتری\n"
+        "   • جیمیل ثبت‌شده روی سفارش\n\n"
+        "اگر یک عدد هم به سفارش بخورد هم به سرویس، ربات حدس نمی‌زند؛ فهرست "
+        "هر دو را با دکمه نشان می‌دهد تا خودتان انتخاب کنید.\n\n"
+        "برای لغو /cancel بفرستید."
+    )
+
+
+def candidate_list_lines(candidates, limit=8):
+    kind_labels = {
+        "order": "🧾 سفارش",
+        "service": "📦 سرویس",
+        "trial": "🧪 تست",
+    }
+
+    lines = []
+
+    for item in candidates[:limit]:
+        lines.append(
+            f"{kind_labels.get(item['kind'], item['kind'])} "
+            f"<b>{item['code']}</b> — "
+            f"{esc(faq_short_label(item['title'], 32))}\n"
+            f"   👤 {esc(item['label'] or '—')} | "
+            f"📌 {esc(faq_short_label(str(item['status']), 22))}"
+        )
+
+    if len(candidates) > limit:
+        lines.append(f"… و {len(candidates) - limit} مورد دیگر")
+
+    return lines
+
+
+def candidates_keyboard(candidates, limit=8):
+    kb = types.InlineKeyboardMarkup(row_width=1)
+
+    kind_labels = {
+        "order": "🧾",
+        "service": "📦",
+        "trial": "🧪",
+    }
+
+    for item in candidates[:limit]:
+        kb.add(
+            types.InlineKeyboardButton(
+                f"{kind_labels.get(item['kind'], '•')} {item['code']} — "
+                f"{faq_short_label(item['title'], 24)}",
+                callback_data=item["callback"]
+            )
+        )
+
+    kb.add(
+        types.InlineKeyboardButton(
+            "🔎 جستجوی دوباره",
+            callback_data="admin:order_search"
+        )
+    )
+    kb.add(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+# ── گزارش کامل سفارش ──────────────────────────────────────────────────────────
+
+def _order_transactions(order_id):
+    with db() as conn:
+        return conn.execute(
+            """
+            SELECT *
+            FROM transactions
+            WHERE order_id=?
+            ORDER BY id
+            """,
+            (order_id,)
+        ).fetchall()
+
+
+def _akhavan_entries_for_order(order_id):
+    with db() as conn:
+        try:
+            return conn.execute(
+                """
+                SELECT *
+                FROM akhavan_profit_ledger
+                WHERE order_id=?
+                ORDER BY id
+                """,
+                (order_id,)
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+
+
+def _order_services(order_id):
+    """سرویس‌هایی که از این سفارش ساخته یا با آن تمدید شده‌اند."""
+
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM active_services
+            WHERE order_id=?
+            ORDER BY id
+            """,
+            (order_id,)
+        ).fetchall()
+
+        renewed = conn.execute(
+            """
+            SELECT *
+            FROM active_services
+            WHERE renewal_order_id=?
+            ORDER BY id
+            """,
+            (order_id,)
+        ).fetchall()
+
+    return list(rows), list(renewed)
+
+
+def admin_order_dossier_sections(order_id, now_dt=None):
+    """
+    گزارش کامل یک سفارش، بخش‌بخش.
+
+    خروجی فهرستی از رشته‌هاست تا هر بخش در یک پیام جداگانه برود و هیچ‌وقت به
+    سقف ۴۰۹۶ کاراکتر تلگرام نخورد. اگر سفارش وجود نداشته باشد [].
+    """
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    with db() as conn:
+        order = conn.execute(
+            """
+            SELECT o.*,
+                   u.username AS username,
+                   u.first_name AS first_name,
+                   u.balance AS user_balance,
+                   u.is_blocked AS user_blocked,
+                   u.created_at AS user_created_at,
+                   u.updated_at AS user_updated_at
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE o.id=?
+            """,
+            (order_id,)
+        ).fetchone()
+
+    if not order:
+        return []
+
+    order = dict(order)
+    product = PRODUCT_INDEX.get(order["product_id"]) or {}
+
+    own_services, renewed_services = _order_services(order_id)
+    transactions = _order_transactions(order_id)
+    profit_entries = _akhavan_entries_for_order(order_id)
+
+    created_dt = _order_dates_parse(order.get("created_at"))
+    updated_dt = _order_dates_parse(order.get("updated_at"))
+    completed_dt = _order_dates_parse(order.get("completed_at"))
+    expired_dt = _order_dates_parse(order.get("expired_at"))
+
+    # ── بخش ۱: سربرگ ─────────────────────────────────────────────────────────
+    header = [
+        f"📦 <b>گزارش کامل سفارش {order_code(order_id)}</b>",
+        f"🔖 کد یکتا: <code>{order_code_long(order_id)}</code>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        "━━━━━━━━━━━━━━━━━━",
+        "📌 وضعیت: <b>"
+        + ORDER_DATES_STATUS_LABELS.get(order["status"], esc(order["status"]))
+        + "</b>",
+    ]
+
+    api_status = order.get("api_status")
+    if api_status:
+        header.append(
+            f"🛰 وضعیت تحویل خودکار: <code>{esc(api_status)}</code>"
+        )
+
+    sections = ["\n".join(header)]
+
+    # ── بخش ۲: مشتری ─────────────────────────────────────────────────────────
+    buyer = [
+        "👤 <b>مشتری</b>",
+        f"   شناسه عددی: <code>{order['user_id']}</code>",
+        f"   نام: {esc(order.get('first_name') or 'بدون نام')}",
+        "   یوزرنیم: "
+        + (
+            f"@{esc(order['username'])}"
+            if order.get("username")
+            else "بدون یوزرنیم"
+        ),
+        "   وضعیت اکانت: "
+        + ("🚫 بلاک" if order.get("user_blocked") else "✅ فعال"),
+    ]
+
+    if order.get("user_balance") is not None:
+        buyer.append(
+            f"   💰 موجودی کیف پول: <b>{money(order['user_balance'])}</b>"
+        )
+
+    reserved_now = get_reserved_total(order["user_id"])
+    if reserved_now:
+        buyer.append(f"   🔒 رزروشده روی سفارش‌های باز: {money(reserved_now)}")
+
+    if order.get("user_created_at"):
+        buyer.append(
+            f"   📝 اولین ورود: {jalali_datetime_str(order['user_created_at'])}"
+        )
+    if order.get("user_updated_at"):
+        buyer.append(
+            f"   🕒 آخرین فعالیت: {jalali_datetime_str(order['user_updated_at'])}"
+        )
+
+    buyer.append("")
+    buyer.append(
+        f"🔗 پروفایل کامل کاربر: <code>/admin</code> → 🔎 پروفایل کاربر → "
+        f"<code>{order['user_id']}</code>"
+    )
+
+    sections.append("\n".join(buyer))
+
+    # ── بخش ۳: محصول ─────────────────────────────────────────────────────────
+    item = [
+        "🛍 <b>محصول</b>",
+        f"   عنوان: <b>{esc(order['product_title'])}</b>",
+        f"   شناسه محصول: <code>{esc(order['product_id'])}</code>",
+        f"   نوع سرویس: <code>{esc(service_for_product(order['product_id']) or '—')}</code>",
+    ]
+
+    if product.get("category_title"):
+        item.append(f"   دسته: {esc(product['category_title'])}")
+    if product.get("plan_title"):
+        item.append(f"   پلن: {esc(product['plan_title'])}")
+    if product.get("volume"):
+        item.append(f"   حجم / نوع: {esc(product['volume'])}")
+
+    current_price = product.get("price")
+    if current_price is not None and int(current_price) != int(order["price"]):
+        item.append(
+            f"   ℹ️ قیمت فعلی همین محصول در فروشگاه: {money(current_price)} "
+            "(قیمت ثبت‌شده روی سفارش ممکن است قدیمی باشد)"
+        )
+
+    sections.append("\n".join(item))
+
+    # ── بخش ۴: مالی ──────────────────────────────────────────────────────────
+    finance = [
+        "💰 <b>مالی</b>",
+        f"   قیمت سفارش: <b>{money(order['price'])}</b>",
+        f"   رزرو از کیف پول: {money(order.get('wallet_reserved') or 0)}",
+        f"   مبلغ نقدی لازم: {money(order.get('cash_required') or 0)}",
+        f"   پرداخت ثبت‌شده: {money(order.get('payment_amount') or 0)}",
+    ]
+
+    if transactions:
+        finance.append("")
+        finance.append("   📒 تراکنش‌های این سفارش:")
+
+        for tx in transactions:
+            amount = int(tx["amount"])
+            sign = "+" if amount >= 0 else "−"
+            finance.append(
+                f"      • {sign}{money(abs(amount))} — "
+                f"<code>{esc(tx['kind'])}</code>"
+                + (f" — {esc(tx['note'])}" if tx["note"] else "")
+                + f"\n        {jalali_datetime_str(tx['created_at'])}"
+            )
+    else:
+        finance.append("   📒 تراکنشی برای این سفارش ثبت نشده است.")
+
+    for entry in profit_entries:
+        try:
+            finance.append("")
+            finance.append(
+                "   💐 سود اخوان: <b>"
+                f"{money(entry['amount'])}</b>"
+                + (
+                    f" (مجموع سود مجموعه: {money(entry['balance_after'])})"
+                    if entry["balance_after"] is not None
+                    else ""
+                )
+            )
+        except Exception:
+            continue
+
+    sections.append("\n".join(finance))
+
+    # ── بخش ۵: تحویل و پنل ───────────────────────────────────────────────────
+    delivery = ["🛰 <b>تحویل و اتصال به پنل</b>"]
+
+    delivery_mode = order.get("delivery_mode")
+    if delivery_mode:
+        delivery.append(
+            f"   روش تحویل: <code>{esc(delivery_mode)}</code>"
+            + (" (خودکار با API)" if delivery_mode == "auto" else " (دستی)")
+        )
+
+    if order.get("service_username"):
+        delivery.append(
+            f"   👤 نام کاربری سرویس در پنل: <b>{esc(order['service_username'])}</b>"
+        )
+    else:
+        delivery.append("   👤 نام کاربری سرویس: ثبت نشده")
+
+    if order.get("api_username") and order.get("api_username") != order.get(
+        "service_username"
+    ):
+        delivery.append(
+            f"   نام کاربری نهایی در پنل: <b>{esc(order['api_username'])}</b>"
+        )
+
+    if order.get("api_renamed_from"):
+        delivery.append(
+            "   ⚠️ پنل نام کاربری را عوض کرده است؛ نام درخواستی: "
+            f"<code>{esc(order['api_renamed_from'])}</code>"
+        )
+
+    if order.get("api_link"):
+        delivery.append(
+            f"   🔗 لینک سابسکریپشن: <code>{esc(order['api_link'])}</code>"
+        )
+
+    if order.get("api_verified_at"):
+        delivery.append(
+            "   🛡 راستی‌آزمایی پنل: "
+            f"{jalali_datetime_str(order['api_verified_at'])}"
+        )
+    elif order.get("api_status") in VERIFIED_API_STATUSES:
+        delivery.append(
+            "   ⚠️ این سفارش قبل از اضافه‌شدن راستی‌آزمایی تحویل شده بود؛ "
+            "زمان تأیید ثبت نشده است."
+        )
+
+    if order.get("api_error"):
+        delivery.append(
+            f"   🔴 آخرین خطای API:\n   <code>{esc(str(order['api_error'])[:600])}</code>"
+        )
+
+    snapshot = order.get("api_panel_snapshot")
+    if snapshot:
+        try:
+            snap = json.loads(snapshot)
+        except (TypeError, ValueError):
+            snap = {}
+
+        if snap:
+            delivery.append("   📋 آخرین وضعیت خوانده‌شده از پنل:")
+            for line in panel_record_summary_lines(snap):
+                delivery.append(f"      {line}")
+
+    if order.get("gmail_address"):
+        delivery.append(
+            f"   📧 جیمیل: <code>{esc(order['gmail_address'])}</code>"
+        )
+
+    if order.get("receipt_file_id"):
+        delivery.append(
+            f"   🧾 فیش واریزی: ثبت شده (<code>{esc(order.get('receipt_type') or '—')}</code>)"
+        )
+    else:
+        delivery.append("   🧾 فیش واریزی: ارسال نشده")
+
+    if order.get("rejection_reason"):
+        delivery.append(
+            f"   ❌ دلیل رد: {esc(order['rejection_reason'])}"
+        )
+
+    if order.get("assigned_admin_id"):
+        delivery.append(
+            f"   👨‍💼 ادمین مسئول: <code>{order['assigned_admin_id']}</code>"
+        )
+
+    if order.get("delivery_message_id"):
+        delivery.append(
+            f"   ✉️ شناسه پیام تحویل به مشتری: <code>{order['delivery_message_id']}</code>"
+        )
+
+    sections.append("\n".join(delivery))
+
+    # ── بخش ۶: زمان‌بندی ─────────────────────────────────────────────────────
+    timing = [
+        "📅 <b>زمان‌بندی</b>",
+        f"   ثبت سفارش: {jalali_datetime_str(order['created_at'])}",
+    ]
+
+    if created_dt and now_dt > created_dt:
+        timing.append(
+            f"   ⏱ از ثبت تا الآن: {format_span_fa(now_dt - created_dt)}"
+        )
+
+    if updated_dt:
+        timing.append(
+            f"   آخرین تغییر وضعیت: {jalali_datetime_str(order['updated_at'])}"
+        )
+
+    if completed_dt:
+        timing.append(
+            f"   📦 تحویل/تکمیل: {jalali_datetime_str(order['completed_at'])}"
+        )
+        if now_dt > completed_dt:
+            timing.append(
+                f"   ⏳ از تحویل تا الآن: {format_span_fa(now_dt - completed_dt)}"
+            )
+
+    if expired_dt:
+        timing.append(
+            f"   ⌛ بسته‌شدن خودکار (پرداخت نشد): "
+            f"{jalali_datetime_str(order['expired_at'])}"
+        )
+
+    if order.get("renewal_for_service"):
+        timing.append("")
+        timing.append(
+            f"   🔄 این سفارش تمدید سرویس "
+            f"{service_code(order['renewal_for_service'])} است."
+        )
+
+    sections.append("\n".join(timing))
+
+    # ── بخش ۷: سرویس‌های متصل ────────────────────────────────────────────────
+    service_lines = ["📦 <b>سرویس‌های متصل به این سفارش</b>"]
+
+    if not own_services and not renewed_services:
+        service_lines.append(
+            "   ℹ️ برای این سفارش سرویس زمان‌دار ثبت نشده است "
+            "(یا هنوز تحویل نشده)."
+        )
+    else:
+        for svc in own_services:
+            service_lines += _dossier_service_lines(svc, now_dt, "از این سفارش ساخته شد")
+
+        for svc in renewed_services:
+            service_lines += _dossier_service_lines(
+                svc, now_dt, "با این سفارش تمدید شد"
+            )
+
+    sections.append("\n".join(service_lines))
+
+    # ── بخش ۸: راهنما ────────────────────────────────────────────────────────
+    sections.append(ID_LEGEND)
+
+    return sections
+
+
+def _dossier_service_lines(svc, now_dt, note=""):
+    lines = [
+        f"   • <b>{service_code(svc['id'])}</b> "
+        f"{service_ref_text(svc)} — {esc(faq_short_label(svc['product_title'], 34))}"
+    ]
+
+    if note:
+        lines.append(f"      ℹ️ {note}")
+
+    lines.append(
+        f"      وضعیت: {'❌ منقضی' if svc['is_expired'] else '✅ فعال'} | "
+        f"{service_type_label(svc)}"
+    )
+
+    lines.append(
+        f"      شروع: {jalali_datetime_str(svc['started_at'])}"
+    )
+
+    if svc["expires_at"]:
+        lines.append(
+            f"      انقضا: {jalali_datetime_str(svc['expires_at'])} — "
+            f"{service_remaining_label(svc['expires_at'], now_dt)}"
+        )
+    else:
+        lines.append("      انقضا: ♾️ نامحدود")
+
+    username = service_field(svc, "service_username")
+    if username:
+        lines.append(f"      👤 نام کاربری پنل: <b>{esc(username)}</b>")
+
+    gmail = service_field(svc, "gmail_address")
+    if gmail:
+        lines.append(f"      📧 جیمیل: <code>{esc(gmail)}</code>")
+
+    if svc["renewal_order_id"]:
+        lines.append(
+            f"      🔄 بعداً با سفارش {order_code(svc['renewal_order_id'])} تمدید شده"
+        )
+
+    # وضعیت زنده از پنل (اگر API در دسترس بود)
+    if username and service_for_product(svc["product_id"]) in {"wireguard", "v2ray"}:
+        try:
+            status = get_live_server_status(svc)
+            lines.append("      🛰 وضعیت لحظه‌ای در پنل:")
+            for line in (server_status_text(svc, status) or "").split("\n"):
+                if line.strip():
+                    lines.append(f"         {line.strip()}")
+        except Exception as exc:
+            lines.append(
+                f"      ⚠️ وضعیت لحظه‌ای از پنل خوانده نشد: {esc(str(exc)[:120])}"
+            )
+
+    return lines
+
+
+def admin_service_dossier_sections(service_id, now_dt=None):
+    """گزارش کامل یک سرویس فعال + سفارش‌های مرتبط با آن."""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    svc = get_active_service_by_id(service_id)
+    if not svc:
+        return []
+
+    with db() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (svc["user_id"],)
+        ).fetchone()
+
+        history = conn.execute(
+            """
+            SELECT *
+            FROM active_services
+            WHERE user_id=?
+            ORDER BY id DESC
+            LIMIT 6
+            """,
+            (svc["user_id"],)
+        ).fetchall()
+
+    lines = [
+        f"📦 <b>گزارش کامل سرویس {service_code(service_id)}</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"🛍 محصول: <b>{esc(svc['product_title'])}</b>",
+        f"🏷 شناسه محصول: <code>{esc(svc['product_id'])}</code>",
+        f"🔖 نوع: {service_type_label(svc)}",
+        f"📌 وضعیت: {'❌ منقضی' if svc['is_expired'] else '✅ فعال'}",
+        "",
+    ]
+
+    if user:
+        lines += [
+            "👤 <b>مشتری</b>",
+            f"   شناسه عددی: <code>{user['user_id']}</code>",
+            f"   نام: {esc(user['first_name'] or 'بدون نام')}",
+            "   یوزرنیم: "
+            + (f"@{esc(user['username'])}" if user["username"] else "بدون یوزرنیم"),
+            f"   💰 موجودی: {money(user['balance'])}",
+            "",
+        ]
+
+    if is_trial_service(svc):
+        lines.append(
+            f"🧪 این سرویس یک اکانت تست است؛ شناسه‌ی تست "
+            f"{trial_code(svc['order_id'])} (نه شماره‌ی سفارش)."
+        )
+
+        trial = get_wireguard_trial_by_id(svc["order_id"])
+        if trial:
+            lines.append(
+                f"   نام کاربری تست: <b>{esc(trial['username'] or '—')}</b>"
+            )
+            lines.append(f"   وضعیت تست: <code>{esc(trial['status'] or '—')}</code>")
+            if trial["panel_link"]:
+                lines.append(
+                    f"   🔗 لینک پنل: <code>{esc(trial['panel_link'])}</code>"
+                )
+    else:
+        order_id = svc["order_id"]
+        order = None
+
+        with db() as conn:
+            order = conn.execute(
+                "SELECT * FROM orders WHERE id=?",
+                (order_id,)
+            ).fetchone()
+
+        lines.append(f"🧾 سفارش مبدأ: {order_code(order_id)}")
+
+        if order:
+            lines.append(
+                "   وضعیت سفارش: "
+                + ORDER_DATES_STATUS_LABELS.get(
+                    order["status"], esc(order["status"])
+                )
+            )
+            lines.append(f"   مبلغ: {money(order['price'])}")
+            lines.append(
+                f"   ثبت سفارش: {jalali_datetime_str(order['created_at'])}"
+            )
+            if order["completed_at"]:
+                lines.append(
+                    f"   تحویل: {jalali_datetime_str(order['completed_at'])}"
+                )
+        else:
+            lines.append("   ⚠️ سفارش مربوطه در دیتابیس پیدا نشد.")
+
+    lines.append("")
+    lines.append("⏱ <b>بازه‌ی زمانی</b>")
+    lines.append(f"   شروع: {jalali_datetime_str(svc['started_at'])}")
+
+    if svc["expires_at"]:
+        lines.append(
+            f"   انقضا: {jalali_datetime_str(svc['expires_at'])} — "
+            f"{service_remaining_label(svc['expires_at'], now_dt)}"
+        )
+    else:
+        lines.append("   انقضا: ♾️ نامحدود")
+
+    username = service_field(svc, "service_username")
+    gmail = service_field(svc, "gmail_address")
+
+    if username:
+        lines.append("")
+        lines.append(f"👤 نام کاربری در پنل: <b>{esc(username)}</b>")
+
+    if gmail:
+        lines.append(f"📧 جیمیل: <code>{esc(gmail)}</code>")
+
+    if username and svc["service_type"] in {"wireguard", "v2ray"}:
+        try:
+            status = get_live_server_status(svc)
+            lines.append("")
+            lines.append("🛰 <b>وضعیت لحظه‌ای در پنل</b>")
+            lines.append(server_status_text(svc, status))
+        except Exception as exc:
+            lines.append("")
+            lines.append(
+                f"⚠️ وضعیت لحظه‌ای از پنل خوانده نشد: <code>{esc(str(exc)[:200])}</code>"
+            )
+
+    if svc["renewal_order_id"]:
+        lines.append("")
+        lines.append(
+            f"🔄 آخرین تمدید: سفارش {order_code(svc['renewal_order_id'])}"
+        )
+
+    lines.append("")
+    lines.append(f"📚 <b>تاریخچه‌ی سرویس‌های این مشتری</b> ({len(history)})")
+
+    for row in history:
+        lines.append(
+            f"   • {service_code(row['id'])} {service_ref_text(row)} — "
+            f"{esc(faq_short_label(row['product_title'], 26))} — "
+            f"{'منقضی' if row['is_expired'] else 'فعال'}"
+        )
+
+    lines.append("")
+    lines.append(ID_LEGEND)
+
+    return _split_report("\n".join(lines))
+
+
+def admin_trial_dossier_sections(trial_id, now_dt=None):
+    """گزارش کامل یک اکانت تست."""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+
+    trial = get_wireguard_trial_by_id(trial_id)
+    if not trial:
+        return []
+
+    with db() as conn:
+        user = conn.execute(
+            "SELECT * FROM users WHERE user_id=?",
+            (trial["user_id"],)
+        ).fetchone()
+
+        svc = conn.execute(
+            """
+            SELECT *
+            FROM active_services
+            WHERE order_id=? AND service_type=?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (trial_id, TRIAL_SERVICE_TYPE)
+        ).fetchone()
+
+    lines = [
+        f"🧪 <b>گزارش کامل اکانت تست {trial_code(trial_id)}</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        "━━━━━━━━━━━━━━━━━━",
+        f"👤 نام کاربری پنل: <b>{esc(trial['username'] or '—')}</b>",
+        f"📌 وضعیت: <code>{esc(trial['status'] or '—')}</code>",
+        f"📝 ثبت درخواست: {jalali_datetime_str(trial['created_at'])}",
+    ]
+
+    if trial["delivered_at"]:
+        lines.append(
+            f"📦 تحویل: {jalali_datetime_str(trial['delivered_at'])}"
+        )
+
+    if trial["delivered_by"]:
+        lines.append(
+            f"👨‍💼 تحویل‌دهنده: <code>{trial['delivered_by']}</code>"
+        )
+
+    if trial["panel_link"]:
+        lines.append(f"🔗 لینک پنل: <code>{esc(trial['panel_link'])}</code>")
+
+    if user:
+        lines += [
+            "",
+            "👤 <b>مشتری</b>",
+            f"   شناسه عددی: <code>{user['user_id']}</code>",
+            f"   نام: {esc(user['first_name'] or 'بدون نام')}",
+            "   یوزرنیم: "
+            + (f"@{esc(user['username'])}" if user["username"] else "بدون یوزرنیم"),
+        ]
+
+    if svc:
+        lines += [
+            "",
+            f"📦 سرویس ثبت‌شده: {service_code(svc['id'])}",
+            f"   شروع: {jalali_datetime_str(svc['started_at'])}",
+        ]
+
+        if svc["expires_at"]:
+            lines.append(
+                f"   انقضا: {jalali_datetime_str(svc['expires_at'])} — "
+                f"{service_remaining_label(svc['expires_at'], now_dt)}"
+            )
+
+    lines += ["", ID_LEGEND]
+
+    return _split_report("\n".join(lines))
+
+
+#: سقف امن هر پیام تلگرام.
+TELEGRAM_TEXT_LIMIT = 4000
+
+
+def _split_report(text, limit=TELEGRAM_TEXT_LIMIT):
+    """یک گزارش بلند را روی مرز خط‌ها به چند پیام تقسیم می‌کند."""
+
+    text = str(text or "")
+
+    if len(text) <= limit:
+        return [text]
+
+    parts = []
+    current = ""
+
+    for line in text.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+
+        if len(candidate) > limit:
+            if current:
+                parts.append(current)
+            current = line[:limit]
+        else:
+            current = candidate
+
+    if current:
+        parts.append(current)
+
+    return parts
+
+
+def send_report_sections(chat_id, sections, keyboard=None):
+    """فرستادن گزارش بخش‌بخش؛ کیبورد فقط زیر آخرین بخش می‌آید."""
+
+    sections = [s for s in (sections or []) if str(s).strip()]
+
+    if not sections:
+        return 0
+
+    for index, section in enumerate(sections):
+        is_last = index == len(sections) - 1
+
+        for chunk in _split_report(section):
+            bot.send_message(
+                chat_id,
+                chunk,
+                reply_markup=keyboard if is_last else None,
+            )
+
+    return len(sections)
+
+
+def admin_dossier_keyboard(kind, ident):
+    kb = types.InlineKeyboardMarkup(row_width=2)
+
+    if kind == "order":
+        kb.row(
+            types.InlineKeyboardButton(
+                "🔄 بروزرسانی گزارش",
+                callback_data=f"admin:dossier:o:{ident}"
+            ),
+            types.InlineKeyboardButton(
+                "📅 تاریخ سفارش",
+                callback_data=f"admin:od:{ident}"
+            ),
+        )
+    else:
+        kb.row(
+            types.InlineKeyboardButton(
+                "🔄 بروزرسانی گزارش",
+                callback_data=f"admin:dossier:{'s' if kind == 'service' else 't'}:{ident}"
+            )
+        )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔎 جستجوی دیگر",
+            callback_data="admin:order_search"
+        ),
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    return kb
+
+
+def show_admin_dossier(chat_id, kind, ident):
+    """
+    نمایش گزارش کامل؛ اگر پیدا نشود پیام روشن می‌دهد.
+    مقدار بازگشتی: True اگر گزارش ارسال شد.
+    """
+
+    try:
+        ident = int(ident)
+    except (TypeError, ValueError):
+        bot.send_message(chat_id, "❌ شناسه نامعتبر است.")
+        return False
+
+    if kind == "order":
+        sections = admin_order_dossier_sections(ident)
+    elif kind == "service":
+        sections = admin_service_dossier_sections(ident)
+    elif kind == "trial":
+        sections = admin_trial_dossier_sections(ident)
+    else:
+        sections = []
+
+    if not sections:
+        labels = {
+            "order": "سفارشی با شماره‌ی",
+            "service": "سرویسی با شناسه‌ی",
+            "trial": "اکانت تستی با شناسه‌ی",
+        }
+        codes = {
+            "order": order_code(ident),
+            "service": service_code(ident),
+            "trial": trial_code(ident),
+        }
+
+        bot.send_message(
+            chat_id,
+            f"❌ {labels.get(kind, 'موردی با شناسه‌ی')} "
+            f"<code>{codes.get(kind, ident)}</code> پیدا نشد.\n\n"
+            + ID_LEGEND,
+            reply_markup=admin_tool_keyboard("admin:order_search"),
+        )
+        return False
+
+    send_report_sections(chat_id, sections, admin_dossier_keyboard(kind, ident))
+    return True
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:dossier:")
+)
+def cb_admin_dossier(call):
+    """`admin:dossier:{o|s|t}:<id>` → گزارش کامل همان رکورد."""
+
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+
+    parts = call.data.split(":")
+
+    # قالب درست: admin : dossier : حرف نوع : شناسه
+    if len(parts) != 4:
+        bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+        return
+
+    kind = {"o": "order", "s": "service", "t": "trial"}.get(parts[2])
+
+    if not kind:
+        bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+        return
+
+    clear_admin_state(call.from_user.id)
+    bot.answer_callback_query(call.id, "گزارش کامل ارسال شد ✅")
+    show_admin_dossier(call.from_user.id, kind, parts[3])
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:order_search"
+)
+def cb_admin_order_search(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+
+    set_admin_state(
+        call.from_user.id,
+        "order_search_lookup",
+        {}
+    )
+
+    bot.answer_callback_query(call.id)
+
+    edit_or_send(
+        call,
+        reference_search_hint(),
+        admin_tool_keyboard()
+    )
+
+
+def handle_order_search_message(message):
+    """ورودی ادمین در حالت «جستجوی سفارش»."""
+
+    admin_id = message.from_user.id
+
+    if message.content_type != "text":
+        bot.send_message(
+            message.chat.id,
+            "❌ لطفاً شماره/شناسه یا نام کاربری را به‌صورت متن بفرستید "
+            "یا /cancel بزنید."
+        )
+        return
+
+    text = (message.text or "").strip()
+
+    if not text:
+        bot.send_message(
+            message.chat.id,
+            "❌ متن خالی است. مثلاً <code>48</code> یا <code>S-46</code> بفرستید."
+        )
+        return
+
+    candidates = resolve_admin_reference(text)
+
+    if not candidates:
+        kind, value = parse_admin_reference(text)
+
+        hint = ""
+        if isinstance(value, int) and kind in (None, "order"):
+            hint = (
+                f"\n\nهیچ سفارش، سرویس یا اکانت تستی با عدد {value} پیدا نشد. "
+                "دقت کنید شماره‌ی سفارش (#) با شناسه‌ی سرویس (S-) فرق دارد."
+            )
+
+        bot.send_message(
+            message.chat.id,
+            f"❌ موردی برای «{esc(text)}» پیدا نشد.{hint}\n\n"
+            + reference_search_hint(),
+            reply_markup=admin_tool_keyboard(),
+        )
+        return
+
+    if len(candidates) == 1:
+        clear_admin_state(admin_id)
+        only = candidates[0]
+
+        bot.send_message(
+            message.chat.id,
+            f"✅ یک مورد پیدا شد: <b>{only['code']}</b> "
+            f"({esc(only['title'])})\nگزارش کامل در ادامه می‌آید 👇"
+        )
+
+        show_admin_dossier(
+            message.chat.id, only["kind"], only["id"]
+        )
+        return
+
+    # چند نتیجه ⇒ ابهام‌زدایی؛ هرگز خودکار انتخاب نمی‌کنیم.
+    lines = [
+        f"🔎 برای «{esc(text)}» <b>{len(candidates)}</b> مورد پیدا شد.",
+        "",
+        "⚠️ این عدد هم به سفارش می‌خورد هم به سرویس/تست؛ لطفاً مورد درست را "
+        "انتخاب کنید تا گزارش کامل همان ارسال شود:",
+        "",
+    ]
+
+    lines += candidate_list_lines(candidates)
+    lines.append("")
+    lines.append(ID_LEGEND)
+
+    bot.send_message(
+        message.chat.id,
+        "\n".join(lines)[:TELEGRAM_TEXT_LIMIT],
+        reply_markup=candidates_keyboard(candidates),
+    )
+
+
+# ── 🧹 سفارش‌های نیمه‌تمام (شماره‌های مصرف‌شده بدون خرید) ─────────────────────
+
+#: چند ساعت فرصت پرداخت؛ بعد از آن سفارش نیمه‌تمام بسته می‌شود.
+ORDER_STALE_HOURS = parse_int_env("ORDER_STALE_HOURS", 72, minimum=1, maximum=24 * 365)
+
+STALE_ORDER_STATUSES = (
+    "awaiting_payment",
+    "awaiting_receipt",
+)
+
+ORDER_DATES_STATUS_LABELS["expired_unpaid"] = "⌛ نیمه‌تمام (پرداخت نشد)"
+
+
+def _order_has_active_flow(order):
+    """
+    اگر کاربر همین لحظه وسط همان سفارش باشد (مثلاً دارد نام کاربری سرویس را
+    وارد می‌کند) سفارش را نیمه‌تمام نمی‌بندیم.
+    """
+
+    try:
+        nav = get_nav(order["user_id"])
+    except Exception:
+        return False
+
+    if not nav:
+        return False
+
+    state = nav.get("state")
+    data = nav.get("data") or {}
+
+    if state not in {
+        "awaiting_service_username",
+        "invoice",
+        "renew_invoice",
+        "payment",
+        "await_receipt",
+    }:
+        return False
+
+    try:
+        return int(data.get("order_id") or 0) == int(order["id"])
+    except (TypeError, ValueError):
+        return False
+
+
+def expire_stale_orders(now_dt=None, hours=None, notify=False):
+    """
+    بستن خودکار سفارش‌هایی که کاربر تا مرحله‌ی پرداخت پیش رفته و رها کرده است.
+
+    چرا لازم است؟
+    این سفارش‌ها یک شماره مصرف می‌کنند ولی هیچ‌وقت خرید نمی‌شوند؛ در نتیجه
+    فهرست سفارش‌ها پر از شماره‌های بی‌سرانجام می‌شود و ادمین نمی‌تواند بفهمد
+    کدام شماره واقعاً یک خرید است. این تابع آن‌ها را با وضعیت روشن
+    «⌛ نیمه‌تمام (پرداخت نشد)» می‌بندد و موجودی رزروشده را به کیف پول
+    مشتری برمی‌گرداند.
+
+    بازگشت: فهرست سفارش‌هایی که بسته شدند.
+    """
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+    hours = int(hours or ORDER_STALE_HOURS)
+    cutoff = (now_dt - timedelta(hours=hours)).isoformat(timespec="seconds")
+
+    placeholders = ",".join("?" for _ in STALE_ORDER_STATUSES)
+
+    with db() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT *
+            FROM orders
+            WHERE status IN ({placeholders})
+            AND COALESCE(updated_at, created_at) < ?
+            ORDER BY id
+            LIMIT 200
+            """,
+            (*STALE_ORDER_STATUSES, cutoff)
+        ).fetchall()
+
+    expired = []
+
+    for order in rows:
+        if _order_has_active_flow(order):
+            continue
+
+        reserved = int(order["wallet_reserved"] or 0)
+
+        with db() as conn:
+            # شرط وضعیت در خود UPDATE هست تا دو ادمین/دو ترد هم‌زمان
+            # یک سفارش را دوباره نبندند.
+            cur = conn.execute(
+                f"""
+                UPDATE orders
+                SET status='expired_unpaid',
+                    expired_at=?,
+                    updated_at=?
+                WHERE id=?
+                AND status IN ({placeholders})
+                """,
+                (
+                    now_dt.isoformat(timespec="seconds"),
+                    now(),
+                    int(order["id"]),
+                    *STALE_ORDER_STATUSES,
+                )
+            )
+
+            if cur.rowcount != 1:
+                continue
+
+            if reserved:
+                conn.execute(
+                    """
+                    UPDATE users
+                    SET balance=balance+?,
+                        updated_at=?
+                    WHERE user_id=?
+                    """,
+                    (reserved, now(), int(order["user_id"]))
+                )
+
+                conn.execute(
+                    """
+                    INSERT INTO transactions(
+                        user_id, order_id, kind, amount, note, created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(order["user_id"]),
+                        int(order["id"]),
+                        "wallet_release",
+                        reserved,
+                        "آزادسازی موجودی — سفارش نیمه‌تمام بسته شد",
+                        now(),
+                    )
+                )
+
+        expired.append(dict(order))
+
+        if notify:
+            try:
+                bot.send_message(
+                    int(order["user_id"]),
+                    f"⌛ سفارش {order_code(order['id'])} "
+                    f"({esc(order['product_title'])}) به دلیل عدم پرداخت بسته شد.\n"
+                    + (
+                        f"💰 مبلغ رزروشده ({money(reserved)}) به کیف پول شما برگشت.\n"
+                        if reserved
+                        else ""
+                    )
+                    + "هر زمان خواستید می‌توانید دوباره سفارش ثبت کنید.",
+                    reply_markup=reply_main_keyboard(),
+                )
+            except Exception:
+                logger.exception(
+                    "Could not notify user %s about stale order #%s",
+                    order["user_id"], order["id"]
+                )
+
+    return expired
+
+
+def admin_stale_orders_text(now_dt=None, limit=None):
+    """فهرست سفارش‌های نیمه‌تمام + شمارش شماره‌های مصرف‌شده."""
+
+    now_dt = now_dt or datetime.now(timezone.utc)
+    limit = limit or ADMIN_TOOLS_LIST_LIMIT
+
+    with db() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM orders WHERE status='expired_unpaid'"
+        ).fetchone()[0]
+
+        open_orders = conn.execute(
+            """
+            SELECT COUNT(*) FROM orders
+            WHERE status IN ('awaiting_payment', 'awaiting_receipt')
+            """
+        ).fetchone()[0]
+
+        rows = conn.execute(
+            """
+            SELECT o.*, u.username AS username, u.first_name AS first_name
+            FROM orders o
+            LEFT JOIN users u ON u.user_id = o.user_id
+            WHERE o.status='expired_unpaid'
+            ORDER BY o.id DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+    lines = [
+        "🧹 <b>سفارش‌های نیمه‌تمام</b>",
+        f"🕒 اکنون: {jalali_datetime_str(now_dt.isoformat())}",
+        "",
+        "این‌ها سفارش‌هایی هستند که مشتری تا مرحله‌ی پرداخت پیش رفته و رها "
+        "کرده است. شماره‌شان مصرف شده ولی خریدی انجام نشده؛ پس در آمار فروش "
+        "هم حساب نمی‌شوند.",
+        "",
+        f"⏳ مهلت پرداخت: <b>{ORDER_STALE_HOURS} ساعت</b>",
+        f"⌛ بسته‌شده تاکنون: <b>{int(total)}</b>",
+        f"🕐 هنوز باز (در انتظار پرداخت/فیش): <b>{int(open_orders)}</b>",
+    ]
+
+    if not rows:
+        lines.append("\n✅ موردی بسته نشده است.")
+        return "\n".join(lines), []
+
+    lines.append("")
+
+    for order in rows:
+        order = dict(order)
+        created = _order_dates_parse(order["created_at"])
+        closed = _order_dates_parse(order.get("expired_at"))
+
+        waited = (
+            format_span_fa((closed or now_dt) - created)
+            if created and (closed or now_dt) > created
+            else "—"
+        )
+
+        lines.append(
+            f"{order_code(order['id'])} | "
+            f"{esc(faq_short_label(order['product_title'], 30))} | "
+            f"{esc(_akhavan_user_label(order))}\n"
+            f"   📝 {jalali_datetime_str(order['created_at'])} — "
+            f"⏱ {waited} بی‌پاسخ\n"
+            f"   💰 {money(order['price'])}"
+            + (
+                f" | برگشت به کیف پول: {money(order['wallet_reserved'])}"
+                if int(order["wallet_reserved"] or 0)
+                else ""
+            )
+        )
+
+    if int(total) > len(rows):
+        lines.append(f"… و {int(total) - len(rows)} مورد دیگر")
+
+    lines.append("")
+    lines.append(ID_LEGEND)
+
+    return "\n".join(lines), [int(o["id"]) for o in rows]
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:stale_orders"
+)
+def cb_admin_stale_orders(call):
+    if call.from_user.id not in ADMIN_IDS:
+        return
+
+    text, order_ids = admin_stale_orders_text()
+
+    kb = types.InlineKeyboardMarkup(row_width=4)
+
+    if order_ids:
+        kb.add(
+            *[
+                types.InlineKeyboardButton(
+                    f"📦 {order_code(order_id)}",
+                    callback_data=f"admin:dossier:o:{order_id}"
+                )
+                for order_id in order_ids
+            ]
+        )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🔄 بروزرسانی",
+            callback_data="admin:stale_orders"
+        )
+    )
+    kb.row(
+        types.InlineKeyboardButton(
+            "⬅️ بازگشت به پنل",
+            callback_data="admin:home"
+        )
+    )
+
+    _admin_tool_view(call, text, kb)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -16684,7 +19373,7 @@ def admin_user_profile(user_id, now_dt=None):
 
         for svc in services:
             lines.append(
-                f"• #{svc['id']} (سفارش #{svc['order_id']}) "
+                f"• {service_code(svc['id'])} {service_ref_text(svc)} """  # noqa: E501
                 f"{esc(faq_short_label(svc['product_title'], 30))}\n"
                 f"   ⏹ {jalali_datetime_str(svc['expires_at']) if svc['expires_at'] else '—'} "
                 f"— {service_remaining_label(svc['expires_at'], now_dt)}"
@@ -16899,7 +19588,7 @@ def admin_expiring_text(now_dt=None, window_days=7):
 
         for svc in rows[:ADMIN_TOOLS_LIST_LIMIT]:
             out.append(
-                f"• #{svc['id']} (سفارش #{svc['order_id']}) "
+                f"• {service_code(svc['id'])} {service_ref_text(svc)} """  # noqa: E501
                 f"{esc(faq_short_label(svc['product_title'], 30))}\n"
                 f"   👤 {esc(_akhavan_user_label(svc))}\n"
                 f"   ⏹ {jalali_datetime_str(svc['expires_at'])} "
@@ -17307,6 +19996,14 @@ def admin_state_message(message):
     if mode == "order_dates_lookup":
 
         handle_order_dates_message(
+            message
+        )
+
+        return
+
+    if mode == "order_search_lookup":
+
+        handle_order_search_message(
             message
         )
 
@@ -19771,6 +22468,63 @@ def check_expiry_loop():
 
             logger.exception(
                 "Error in expiry check loop"
+            )
+
+        # ── بستن خودکار سفارش‌های نیمه‌تمام ──────────────────────────────────
+        # سفارش‌هایی که مشتری تا مرحله‌ی پرداخت رفته و رها کرده، بعد از
+        # ORDER_STALE_HOURS ساعت بسته می‌شوند تا شماره‌های مصرف‌شده در فهرست
+        # سفارش‌ها مبهم نمانند و موجودی رزروشده به کیف پول برگردد.
+        try:
+
+            closed = expire_stale_orders(
+                notify=True
+            )
+
+            if closed:
+
+                logger.info(
+                    "Auto-closed %s stale unpaid order(s): %s",
+                    len(closed),
+                    [o["id"] for o in closed]
+                )
+
+                for admin_id in sorted(ADMIN_IDS):
+                    try:
+                        bot.send_message(
+                            admin_id,
+                            "🧹 <b>بسته‌شدن خودکار سفارش‌های نیمه‌تمام</b>\n\n"
+                            f"تعداد: <b>{len(closed)}</b> سفارش که بیش از "
+                            f"{ORDER_STALE_HOURS} ساعت پرداخت نشده بود.\n\n"
+                            + "\n".join(
+                                f"   • {order_code(o['id'])} — "
+                                f"{esc(faq_short_label(o['product_title'], 30))} — "
+                                f"{money(o['price'])}"
+                                for o in closed[:12]
+                            )
+                            + (
+                                f"\n   … و {len(closed) - 12} مورد دیگر"
+                                if len(closed) > 12
+                                else ""
+                            )
+                            + "\n\n💰 موجودی رزروشده‌ی این سفارش‌ها به کیف پول "
+                            "مشتریان برگشت.",
+                            reply_markup=types.InlineKeyboardMarkup().row(
+                                types.InlineKeyboardButton(
+                                    "🧹 مشاهده فهرست",
+                                    callback_data="admin:stale_orders"
+                                )
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Could not notify admin %s about stale orders",
+                            admin_id
+                        )
+
+        except Exception:
+
+            logger.exception(
+                "Error closing stale unpaid orders"
             )
 
         time.sleep(
