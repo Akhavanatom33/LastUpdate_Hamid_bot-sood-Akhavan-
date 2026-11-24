@@ -136,6 +136,26 @@ class GlobalTrialQuotaResetTests(BotDatabaseTestCase):
 
 
 class AkhavanProfitTests(BotDatabaseTestCase):
+    def test_v2ray_catalog_has_exact_volumes_and_six_thousand_per_gb(self):
+        expected_volumes = {10, 20, 30, 40, 50, 100, 200}
+        for prefix in ("v2ray-", "v2raym-"):
+            items = [p for p in bot.PRODUCT_INDEX.values() if p["id"].startswith(prefix)]
+            actual = {int(p["id"].split("-")[1].removesuffix("gb")) for p in items}
+            self.assertEqual(actual, expected_volumes)
+            for product in items:
+                with self.subTest(product=product["id"]):
+                    self.assertEqual(product["price"], int(product["id"].split("-")[1].removesuffix("gb")) * 6000)
+
+    def test_v2ray_profit_is_five_hundred_per_gb_for_both_terms(self):
+        for product_id, expected in (
+            ("v2ray-10gb", 5_000),
+            ("v2ray-200gb", 100_000),
+            ("v2raym-10gb", 5_000),
+            ("v2raym-200gb", 100_000),
+        ):
+            with self.subTest(product=product_id):
+                self.assertEqual(bot.akhavan_profit_for_product(product_id), expected)
+
     def test_shared_chatgpt_profit_rates(self):
         self.assertEqual(bot.akhavan_profit_for_product("chatgpt-shared-15"), 25_000)
         self.assertEqual(bot.akhavan_profit_for_product("chatgpt-shared-10"), 37_500)

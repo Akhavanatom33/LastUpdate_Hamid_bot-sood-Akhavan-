@@ -368,6 +368,37 @@ class OrderSearchFlowTests(CollidingIdMixin, OrderDatesBase):
         self.assertIn("گزارش کامل سفارش", all_text)
         self.assertIn("ChatGPT Plus", all_text)
 
+    def test_orders_direct_number_lookup_opens_order_despite_colliding_service_id(self):
+        self._prepare()
+        bot.set_admin_state(ADMIN_ID, "order_number_lookup", {})
+        bot.handle_admin_order_number_message(self.admin_message(str(self.order_id)))
+
+        all_text = "\n".join(text for _chat, text, _kw in self.sent)
+        self.assertIn("گزارش کامل سفارش", all_text)
+        self.assertIn("ChatGPT Plus", all_text)
+        self.assertIsNone(bot.get_admin_state(ADMIN_ID))
+
+    def test_manual_monthly_v2ray_completion_registers_expiring_service(self):
+        order_id = self.add_order(
+            status="paid_pending_fulfillment",
+            product_id="v2raym-10gb",
+            title="V2Ray ماهیانه ۱۰ گیگ",
+            service_username="manual_vpn",
+        )
+        ok, _message = bot.mark_order_delivered(ADMIN_ID, order_id)
+        self.assertTrue(ok)
+        services = bot.get_active_services(USER_ID)
+        service = next(item for item in services if item["order_id"] == order_id)
+        self.assertIsNotNone(service["expires_at"])
+
+    def test_order_dossier_keyboard_has_previous_and_next_when_orders_exist(self):
+        first = self.add_order()
+        second = self.add_order()
+        third = self.add_order()
+        data = callback_datas(bot.admin_dossier_keyboard("order", second))
+        self.assertIn(f"admin:dossier_nav:prev:{second}", data)
+        self.assertIn(f"admin:dossier_nav:next:{second}", data)
+
     def test_ambiguous_number_shows_disambiguation_menu(self):
         self._prepare()
 

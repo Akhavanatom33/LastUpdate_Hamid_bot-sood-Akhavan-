@@ -410,6 +410,54 @@ class PayloadContractTests(EylanProvisioningBase):
                     f"{product_id} فیلد(های) نامعتبر می‌فرستد: {sorted(unknown)}"
                 )
 
+    def test_monthly_v2ray_payload_has_thirty_day_expiry(self):
+        create_payload = bot.eylan_payload_for_product(
+            "v2raym-20gb", "ali_vpn", client=self.panel
+        )
+        self.assertEqual(create_payload["data_limit"], 20)
+        self.assertEqual(create_payload["activation_type"], "fixed_date")
+        self.assertEqual(create_payload["expiry_days"], 30)
+
+        self.panel.seed_user(
+            "ali_vpn",
+            expiry_date_actual_iso=(NOW + timedelta(days=5)).strftime(
+                "%Y-%m-%dT23:59:59+00:00"
+            ),
+        )
+        update_payload = bot.eylan_payload_for_product(
+            "v2raym-20gb", "ali_vpn", for_update=True,
+            client=self.panel, remote=self.panel.get_user("ali_vpn"),
+        )
+        self.assertEqual(
+            update_payload["expiry_date_str"],
+            (NOW + timedelta(days=35)).date().isoformat(),
+        )
+        self.assertNotIn("expiry_days", update_payload)
+
+    def test_monthly_v2ray_active_service_expires_after_thirty_days(self):
+        monthly_id = self.add_fulfilling_order(
+            product_id="v2raym-10gb", title="V2Ray ماهیانه ۱۰ گیگ"
+        )
+        bot.ensure_eylan_active_service(self.get_order(monthly_id), monthly_id)
+        services = bot.get_active_services(USER_ID)
+        service = next(s for s in services if s["order_id"] == monthly_id)
+        self.assertIsNotNone(service["expires_at"])
+
+        unlimited_id = self.add_fulfilling_order(
+            username="unlimited_user", product_id="v2ray-10gb", title="V2Ray نامحدود ۱۰ گیگ"
+        )
+        bot.ensure_eylan_active_service(self.get_order(unlimited_id), unlimited_id)
+        services = bot.get_active_services(USER_ID)
+        unlimited = next(s for s in services if s["order_id"] == unlimited_id)
+        self.assertIsNone(unlimited["expires_at"])
+
+    def test_unlimited_v2ray_does_not_send_expiry(self):
+        payload = bot.eylan_payload_for_product(
+            "v2ray-20gb", "ali_vpn", client=self.panel
+        )
+        self.assertNotIn("expiry_days", payload)
+        self.assertNotIn("expiry_date_str", payload)
+
     def test_renewal_payload_uses_expiry_date_str_not_expiry_days(self):
         """
         باگ اصلی تمدید: PUT فیلد expiry_days را قبول ندارد، پس تمدید
