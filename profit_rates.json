@@ -8,6 +8,6 @@
     "chatgpt-shared-5": 50000
   },
   "per_gb": {
-    "v2ray": 750
+    "v2ray": 500
   }
 }

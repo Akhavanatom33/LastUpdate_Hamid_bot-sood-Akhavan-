@@ -426,7 +426,7 @@ AKHAVAN_PROFIT_DEFAULT_RATES = {
         "chatgpt-shared-5": 50000,
     },
     "per_gb": {
-        "v2ray": 750,
+        "v2ray": 500,
     },
 }
 
@@ -441,8 +441,12 @@ except (OSError, ValueError):
     AKHAVAN_PROFIT_RATES = AKHAVAN_PROFIT_DEFAULT_RATES
 
 V2RAY_GB_RE = re.compile(
-    r"^v2ray-(\d+(?:\.\d+)?)gb$"
+    r"^v2raym?-(\d+(?:\.\d+)?)gb$"
 )
+
+
+def is_monthly_v2ray_product(product_id):
+    return str(product_id or "").startswith("v2raym-")
 
 
 def akhavan_profit_for_product(product_id):
@@ -2291,14 +2295,16 @@ def renew_service(
     service_id,
     new_order_id
 ):
-    new_expires = (
-        datetime.now(timezone.utc)
-        + timedelta(days=30)
-    ).isoformat(
-        timespec="seconds"
-    )
+    now_dt = datetime.now(timezone.utc)
 
     with db() as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM active_services WHERE id=?",
+            (service_id,),
+        ).fetchone()
+        current_expiry = _order_dates_parse(row["expires_at"]) if row else None
+        base_dt = max(now_dt, current_expiry) if current_expiry else now_dt
+        new_expires = (base_dt + timedelta(days=30)).isoformat(timespec="seconds")
         conn.execute(
             """
             UPDATE active_services
@@ -3183,8 +3189,12 @@ def inline_server_menu():
             callback_data="srv:wireguard"
         ),
         types.InlineKeyboardButton(
-            "🛜 سرویس V2Ray مولتی‌لوکیشن",
+            "🛜 V2Ray نامحدود زمانی",
             callback_data="srv:v2ray"
+        ),
+        types.InlineKeyboardButton(
+            "🇹🇷 V2Ray ماهیانه (۳۰ روزه)",
+            callback_data="srv:v2raym"
         )
     )
 
@@ -3245,6 +3255,13 @@ def v2ray_items():
     ]
 
 
+def v2ray_monthly_items():
+    return [
+        p for p in PRODUCT_INDEX.values()
+        if p["id"].startswith("v2raym-")
+    ]
+
+
 def show_service_products(
     call,
     service
@@ -3265,19 +3282,31 @@ def show_service_products(
 
         info_cb = "service_info:wireguard"
 
+    elif service == "v2raym":
+
+        items = v2ray_monthly_items()
+        title = (
+            "🇹🇷 <b>V2Ray ماهیانه — تک سرور ترکیه</b>\n\n"
+            "⏱ اعتبار: <b>۳۰ روز</b>\n"
+            "⚡ تک سرور ترکیه، پرسرعت بدون قطعی\n"
+            "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
+            "برای خرید، حجم موردنظر را انتخاب کنید."
+        )
+        state = "v2raym"
+        parent = "server"
+        info_cb = "service_info:v2raym"
+
     else:
 
         items = v2ray_items()
-
         title = (
-            "🛜 <b>سرویس V2Ray مولتی‌لوکیشن</b>\n\n"
-            "⏱ اعتبار: <b>نامحدود زمان ♾️</b>\n\n"
+            "🛜 <b>سرویس V2Ray نامحدود زمانی</b>\n\n"
+            "⏱ اعتبار: <b>نامحدود زمان ♾️</b>\n"
+            "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
             "برای خرید، حجم موردنظر را انتخاب کنید."
         )
-
         state = "v2ray"
         parent = "server"
-
         info_cb = "service_info:v2ray"
 
     save_nav(
@@ -3459,6 +3488,9 @@ def show_personal_ai(call):
 def product_back_state(product_id):
     if product_id.startswith("wireguard-"):
         return "wireguard"
+
+    if product_id.startswith("v2raym-"):
+        return "v2raym"
 
     if product_id.startswith("v2ray-"):
         return "v2ray"
@@ -4255,7 +4287,7 @@ def service_for_product(product_id):
     if product_id.startswith("wireguard-"):
         return "wireguard"
 
-    if product_id.startswith("v2ray-"):
+    if product_id.startswith(("v2ray-", "v2raym-")):
         return "v2ray"
 
     if product_id.startswith("chatgpt-"):
@@ -4343,7 +4375,12 @@ def delivery_template(
         )
 
     if service == "v2ray":
-
+        product_id = str(order["product_id"] or "")
+        term_line = (
+            "⏱ اعتبار سرویس: <b>۳۰ روز</b>\n\n"
+            if is_monthly_v2ray_product(product_id)
+            else "⏱ اعتبار سرویس: <b>نامحدود زمانی</b> ♾️\n\n"
+        )
         return (
             "🎉 <b>سفارش شما با موفقیت آماده شد!</b>\n\n"
             "🙏 از اینکه این ربات را برای خرید سرویس خود انتخاب کردید، صمیمانه سپاسگزاریم.\n"
@@ -4351,6 +4388,7 @@ def delivery_template(
             "✅ <b>رسید سفارش شما تأیید شد.</b>\n\n"
             "🛜 <b>لینک ساب شما:</b>\n\n"
             f"{link_box}\n\n"
+            f"{term_line}"
             "📌 لینک بالا را باز کنید و در برنامه اتصال موردنظر خود وارد کنید.\n\n"
             "📚 <b>آموزش اتصال V2Ray</b>\n"
             "برای مشاهده آموزش کامل، از منوی پایین روی «🔗 نحوه اتصال» بزنید.\n"
@@ -4821,7 +4859,7 @@ def eylan_plan_for_product(product_id):
 def _plan_service(product_id):
     if product_id.startswith("wireguard-"):
         return "wireguard"
-    if product_id.startswith("v2ray-"):
+    if product_id.startswith(("v2ray-", "v2raym-")):
         return "v2ray"
     return None
 
@@ -5086,9 +5124,8 @@ def eylan_payload_for_product(
 
         return payload
 
-    # V2Ray in EylanPanel is exposed through Sing-box. These shop products are
-    # time-unlimited, so no fixed expiry field is sent. Access is controlled
-    # by the data limit and the allowed Sing-box inbounds.
+    # V2Ray in EylanPanel is exposed through Sing-box. Monthly products carry
+    # a fixed 30-day expiry; unlimited products are controlled only by traffic.
     payload["enable_singbox"] = True
     payload["enable_wg1"] = False
     payload["enable_openvpn"] = bool(plan.get("enable_openvpn", False))
@@ -5097,6 +5134,22 @@ def eylan_payload_for_product(
 
     inbounds = _resolve_singbox_inbounds(api_client, plan)
     payload["singbox_inbounds"] = inbounds
+
+    if is_monthly_v2ray_product(product_id):
+        expiry_days = max(1, int(plan.get("expiry_days", 30)))
+        if for_update:
+            base_dt = _remote_expiry_base(remote, _eylan_now())
+            payload["expiry_date_str"] = (
+                base_dt + timedelta(days=expiry_days)
+            ).date().isoformat()
+        else:
+            payload["activation_type"] = _plan_activation_type(plan)
+            if payload["activation_type"] == "fixed_date":
+                payload["expiry_days"] = expiry_days
+            else:
+                payload["pending_activation_days"] = max(
+                    1, int(plan.get("pending_activation_days", 2))
+                )
 
     if not for_update:
         payload["username"] = username.strip()
@@ -5289,8 +5342,10 @@ def ensure_eylan_active_service(order, order_id):
     )
 
     if renewal_for_service_id:
-        # V2Ray products are time-unlimited; there is no local expiry to extend.
-        if service == "wireguard":
+        has_expiry = service == "wireguard" or is_monthly_v2ray_product(
+            order["product_id"]
+        )
+        if has_expiry:
             renew_service(renewal_for_service_id, order_id)
         else:
             with db() as conn:
@@ -5322,7 +5377,9 @@ def ensure_eylan_active_service(order, order_id):
         return existing["id"]
 
     plan = eylan_plan_for_product(order["product_id"])
-    has_expiry = service == "wireguard"
+    has_expiry = service == "wireguard" or is_monthly_v2ray_product(
+        order["product_id"]
+    )
     expiry_days = int(plan.get("expiry_days", 30)) if has_expiry else 0
 
     return create_active_service(
@@ -5513,7 +5570,8 @@ def provision_eylan_order_with_api(order, force=False):
 
         # پنل EylanPanel در PUT فیلد expiry_days را نمی‌پذیرد؛ بدون تاریخ
         # صریح، تمدید «موفق» گزارش می‌شد ولی تاریخ انقضا تکان نمی‌خورد.
-        if service == "wireguard" and expected_expiry is None:
+        requires_expiry = service == "wireguard" or is_monthly_v2ray_product(product_id)
+        if requires_expiry and expected_expiry is None:
             raise EylanPanelError(
                 "payload تمدید بدون تاریخ انقضای صریح (expiry_date_str) ساخته شد. "
                 "پنل EylanPanel در ویرایش کاربر فیلد expiry_days را نادیده "
@@ -6344,10 +6402,18 @@ def deliver_order_payload(
     ):
         if renewal_for_service_id:
 
-            renew_service(
-                renewal_for_service_id,
-                order_id
-            )
+            if has_expiry:
+                renew_service(renewal_for_service_id, order_id)
+            else:
+                with db() as conn:
+                    conn.execute(
+                        """
+                        UPDATE active_services
+                        SET renewal_order_id=?, is_expired=0
+                        WHERE id=?
+                        """,
+                        (order_id, renewal_for_service_id),
+                    )
 
         else:
 
@@ -6397,7 +6463,9 @@ def deliver_order_payload(
 
                 register_service_or_renew(
                     service,
-                    service == "wireguard"
+                    service == "wireguard" or is_monthly_v2ray_product(
+                        order["product_id"]
+                    )
                 )
 
             else:
@@ -6421,7 +6489,9 @@ def deliver_order_payload(
 
                 register_service_or_renew(
                     service,
-                    service == "wireguard"
+                    service == "wireguard" or is_monthly_v2ray_product(
+                        order["product_id"]
+                    )
                 )
 
         elif message.content_type in (
@@ -6460,7 +6530,9 @@ def deliver_order_payload(
 
             register_service_or_renew(
                 service,
-                service == "wireguard"
+                service == "wireguard" or is_monthly_v2ray_product(
+                    order["product_id"]
+                )
             )
 
         else:
@@ -9934,6 +10006,22 @@ def cb_v2ray(call):
 
 
 @bot.callback_query_handler(
+    func=lambda c: c.data == "srv:v2raym"
+)
+def cb_v2ray_monthly(call):
+    if not is_member(call.from_user.id):
+        bot.answer_callback_query(
+            call.id,
+            "ابتدا عضویت خود را تکمیل کنید.",
+            show_alert=True
+        )
+        return
+
+    bot.answer_callback_query(call.id)
+    show_service_products(call, "v2raym")
+
+
+@bot.callback_query_handler(
     func=lambda c: c.data == "wg_trial_start"
 )
 def cb_wg_trial_start(call):
@@ -10153,15 +10241,24 @@ def cb_service_info(call):
 
         service = "wireguard"
 
-    else:
-
+    elif kind == "v2raym":
         text = (
-            "ℹ️ <b>اطلاعات سرویس V2Ray مولتی‌لوکیشن</b>\n\n"
-            "⏱ زمان: نامحدود ♾️\n"
-            "📦 حجم‌ها از ۱۵ تا ۲۰۰ گیگابایت\n\n"
-            "بعد از تأیید پرداخت، لینک ساب یا فایل تنظیمات از طرف ادمین برای شما ارسال می‌شود."
+            "ℹ️ <b>اطلاعات V2Ray ماهیانه</b>\n\n"
+            "⚡ تک سرور ترکیه، پرسرعت بدون قطعی\n"
+            "⏱ اعتبار: ۳۰ روز\n"
+            "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n"
+            "📦 حجم‌ها: ۱۰، ۲۰، ۳۰، ۴۰، ۵۰، ۱۰۰ و ۲۰۰ گیگابایت\n\n"
+            "پس از تأیید پرداخت، لینک ساب یا اطلاعات اتصال توسط ادمین ارسال می‌شود."
         )
-
+        service = "v2raym"
+    else:
+        text = (
+            "ℹ️ <b>اطلاعات سرویس V2Ray نامحدود</b>\n\n"
+            "⏱ زمان: نامحدود ♾️\n"
+            "📦 حجم‌ها: ۱۰، ۲۰، ۳۰، ۴۰، ۵۰، ۱۰۰ و ۲۰۰ گیگابایت\n"
+            "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
+            "پس از تأیید پرداخت، لینک ساب یا اطلاعات اتصال توسط ادمین ارسال می‌شود."
+        )
         service = "v2ray"
 
     save_nav(
@@ -13432,6 +13529,10 @@ def cb_admin_orders(call):
     )
 
     kb.add(
+        types.InlineKeyboardButton(
+            "🔢 نمایش مستقیم با شماره سفارش",
+            callback_data="admin:order_lookup"
+        ),
         types.InlineKeyboardButton(
             "⬅️ بازگشت به پنل",
             callback_data="admin:home"
@@ -18670,10 +18771,34 @@ def send_report_sections(chat_id, sections, keyboard=None):
     return len(sections)
 
 
+def _adjacent_order_id(order_id, direction):
+    """Return the nearest existing order id before/after the current one."""
+    operator, ordering = ("<", "DESC") if direction == "prev" else (">", "ASC")
+    with db() as conn:
+        row = conn.execute(
+            f"SELECT id FROM orders WHERE id {operator} ? ORDER BY id {ordering} LIMIT 1",
+            (int(order_id),),
+        ).fetchone()
+    return int(row["id"]) if row else None
+
+
 def admin_dossier_keyboard(kind, ident):
     kb = types.InlineKeyboardMarkup(row_width=2)
 
     if kind == "order":
+        prev_id = _adjacent_order_id(ident, "prev")
+        next_id = _adjacent_order_id(ident, "next")
+        nav_buttons = []
+        if prev_id is not None:
+            nav_buttons.append(types.InlineKeyboardButton(
+                "⬅️ سفارش قبلی", callback_data=f"admin:dossier_nav:prev:{ident}"
+            ))
+        if next_id is not None:
+            nav_buttons.append(types.InlineKeyboardButton(
+                "سفارش بعدی ➡️", callback_data=f"admin:dossier_nav:next:{ident}"
+            ))
+        if nav_buttons:
+            kb.row(*nav_buttons)
         kb.row(
             types.InlineKeyboardButton(
                 "🔄 بروزرسانی گزارش",
@@ -18799,6 +18924,74 @@ def cb_admin_dossier(call):
     clear_admin_state(call.from_user.id)
     bot.answer_callback_query(call.id, "گزارش کامل ارسال شد ✅")
     show_admin_dossier(call.from_user.id, kind, parts[3])
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data == "admin:order_lookup"
+)
+def cb_admin_order_lookup(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    set_admin_state(call.from_user.id, "order_number_lookup", {})
+    bot.answer_callback_query(call.id)
+    edit_or_send(
+        call,
+        "🔢 شماره سفارش را بفرستید (مثلاً <code>48</code> یا <code>#48</code>).",
+        admin_tool_keyboard(),
+    )
+
+
+def handle_admin_order_number_message(message):
+    """Orders-menu lookup: numeric input always means an order id, not S-/T-."""
+    raw = (
+        (message.text or "").strip().translate(_ORDER_NUMBER_DIGITS)
+        if message.content_type == "text"
+        else ""
+    )
+    match = re.fullmatch(r"(?:#|ORD-)?\s*(\d+)", raw, re.IGNORECASE)
+    if not match or int(match.group(1)) <= 0:
+        bot.send_message(
+            message.chat.id,
+            "❌ فقط شماره سفارش را بفرستید؛ مثلاً <code>48</code> یا <code>#48</code>.",
+            reply_markup=admin_tool_keyboard(),
+        )
+        return
+    order_id = int(match.group(1))
+    if not show_admin_dossier(message.chat.id, "order", order_id):
+        set_admin_state(message.from_user.id, "order_number_lookup", {})
+        bot.send_message(
+            message.chat.id,
+            "برای شماره واردشده سفارشی پیدا نشد. می‌توانید شماره دیگری بفرستید.",
+            reply_markup=admin_tool_keyboard("admin:order_lookup"),
+        )
+    else:
+        clear_admin_state(message.from_user.id)
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:dossier_nav:")
+)
+def cb_admin_dossier_navigation(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        _, _, direction, current_id = call.data.split(":", 3)
+        current_id = int(current_id)
+        if direction not in {"prev", "next"}:
+            raise ValueError
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "درخواست نامعتبر است.", show_alert=True)
+        return
+
+    target_id = _adjacent_order_id(current_id, direction)
+    if target_id is None:
+        bot.answer_callback_query(call.id, "سفارش دیگری پیدا نشد.", show_alert=True)
+        return
+    clear_admin_state(call.from_user.id)
+    bot.answer_callback_query(call.id)
+    show_admin_dossier(call.from_user.id, "order", target_id)
 
 
 @bot.callback_query_handler(
@@ -20072,6 +20265,12 @@ def admin_state_message(message):
 
         return
 
+    if mode == "order_number_lookup":
+
+        handle_admin_order_number_message(message)
+
+        return
+
     if mode == "order_search_lookup":
 
         handle_order_search_message(
@@ -21097,7 +21296,7 @@ def get_last_service_username(
             FROM orders
             WHERE user_id=?
             AND status='completed'
-            AND product_id LIKE ?
+            AND (product_id LIKE ? OR product_id LIKE ?)
             AND service_username IS NOT NULL
             AND TRIM(service_username) <> ''
             AND id <> ?
@@ -21107,6 +21306,7 @@ def get_last_service_username(
             (
                 user_id,
                 f"{service}-%",
+                "v2raym-%" if service == "v2ray" else "__no_match__",
                 int(exclude_order_id or 0)
             )
         ).fetchone()
@@ -21886,7 +22086,8 @@ def navigate_back(message):
 
     elif state in (
         "wireguard",
-        "v2ray"
+        "v2ray",
+        "v2raym"
     ):
 
         show_server_menu(
@@ -21946,11 +22147,11 @@ def navigate_back(message):
                 "wireguard"
             )
 
-        elif back == "v2ray":
+        elif back in ("v2ray", "v2raym"):
 
             show_products_from_user(
                 message,
-                "v2ray"
+                back
             )
 
         else:
@@ -21991,7 +22192,8 @@ def navigate_back(message):
                     "server"
                     if back_state in (
                         "wireguard",
-                        "v2ray"
+                        "v2ray",
+                        "v2raym"
                     )
                     else "ai"
                 ),
@@ -22010,11 +22212,11 @@ def navigate_back(message):
                     "wireguard"
                 )
 
-            elif back_state == "v2ray":
+            elif back_state in ("v2ray", "v2raym"):
 
                 show_products_from_user(
                     message,
-                    "v2ray"
+                    back_state
                 )
 
             else:
@@ -22104,7 +22306,8 @@ def navigate_back(message):
 
         if service in (
             "wireguard",
-            "v2ray"
+            "v2ray",
+            "v2raym"
         ):
 
             show_products_from_user(
@@ -22305,19 +22508,28 @@ def show_products_from_user(
             "service_info:wireguard"
         )
 
+    elif service == "v2raym":
+
+        items = v2ray_monthly_items()
+        text = (
+            "🇹🇷 <b>V2Ray ماهیانه — تک سرور ترکیه</b>\n\n"
+            "⏱ اعتبار: <b>۳۰ روز</b>\n"
+            "⚡ تک سرور ترکیه، پرسرعت بدون قطعی\n"
+            "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
+            "برای خرید، حجم موردنظر را انتخاب کنید."
+        )
+        info_cb = "service_info:v2raym"
+
     else:
 
         items = v2ray_items()
-
         text = (
-            "🛜 <b>سرویس V2Ray مولتی‌لوکیشن</b>\n\n"
-            "⏱ اعتبار: <b>نامحدود زمان ♾️</b>\n\n"
+            "🛜 <b>سرویس V2Ray نامحدود زمانی</b>\n\n"
+            "⏱ اعتبار: <b>نامحدود زمان ♾️</b>\n"
+            "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
             "برای خرید، حجم موردنظر را انتخاب کنید."
         )
-
-        info_cb = (
-            "service_info:v2ray"
-        )
+        info_cb = "service_info:v2ray"
 
     kb = types.InlineKeyboardMarkup(
         row_width=2
@@ -23029,6 +23241,17 @@ def mark_order_delivered(admin_id, order_id):
         )
 
     save_order_api_state(order_id, delivery_mode="manual_admin")
+    if service_for_product(order["product_id"]) in {"wireguard", "v2ray"}:
+        try:
+            # Register the local service record even when the admin completes
+            # fulfillment outside the bot; this is needed for monthly expiry,
+            # renewal history and the user's service list.
+            ensure_eylan_active_service(order, order_id)
+        except Exception:
+            logger.exception(
+                "Could not register local service for manually delivered order #%s",
+                order_id,
+            )
     complete_order(order_id)
 
     try:

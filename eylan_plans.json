@@ -149,5 +149,99 @@
     "enable_openvpn": false,
     "enable_singbox": true,
     "singbox_inbounds": []
+  },
+  "v2ray-10gb": {
+    "service": "v2ray",
+    "data_limit": 10,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-10gb": {
+    "service": "v2ray",
+    "data_limit": 10,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-20gb": {
+    "service": "v2ray",
+    "data_limit": 20,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-30gb": {
+    "service": "v2ray",
+    "data_limit": 30,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-40gb": {
+    "service": "v2ray",
+    "data_limit": 40,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-50gb": {
+    "service": "v2ray",
+    "data_limit": 50,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-100gb": {
+    "service": "v2ray",
+    "data_limit": 100,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
+  },
+  "v2raym-200gb": {
+    "service": "v2ray",
+    "data_limit": 200,
+    "data_limit_unit": "GB",
+    "max_clients": 1,
+    "activation_type": "fixed_date",
+    "expiry_days": 30,
+    "enable_wg1": false,
+    "enable_openvpn": false,
+    "enable_singbox": true,
+    "singbox_inbounds": []
   }
 }
