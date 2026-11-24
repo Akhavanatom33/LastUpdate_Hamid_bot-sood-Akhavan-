@@ -53,13 +53,13 @@ class AdminToolsBase(OrderDatesBase):
             )
             return int(cur.lastrowid)
 
-    def call(self, data, user=ADMIN_ID):
+    def call(self, data, user=ADMIN_ID, message_id=10):
         return SimpleNamespace(
             id="1",
             data=data,
             from_user=SimpleNamespace(id=user),
             message=SimpleNamespace(
-                chat=SimpleNamespace(id=user), message_id=10
+                chat=SimpleNamespace(id=user, type="private"), message_id=message_id
             ),
         )
 
@@ -149,8 +149,120 @@ class UserProfileTests(AdminToolsBase):
         _chat, text, kwargs = self.sent[-1]
         self.assertIn("پروفایل کاربر", text)
         data = callback_datas(kwargs["reply_markup"])
-        self.assertIn(f"admin:od:{order_id}", data)
+        self.assertIn(f"admin:dossier:o:{order_id}", data)
         self.assertIn(f"admin:uprof_wallet:{USER_ID}", data)
+
+    def test_profile_has_quick_actions_for_services_with_panel_usernames(self):
+        order_id = self.add_order(completed=NOW - timedelta(days=1))
+        service_id = self.make_service(
+            order_id,
+            NOW - timedelta(days=1),
+            NOW + timedelta(days=29),
+            service_type="v2ray",
+            product_id="v2raym-10gb",
+            product_title="V2Ray ماهیانه ۱۰ گیگ",
+            service_username="monthly_vpn",
+        )
+        data = callback_datas(bot.admin_user_profile_keyboard(USER_ID, [order_id]))
+        self.assertIn(f"admin:dossier:o:{order_id}", data)
+        self.assertIn(f"admin:service_panel:{service_id}", data)
+
+    def test_recent_users_list_has_direct_profile_buttons_and_search(self):
+        markup = bot.admin_users_keyboard()
+        data = callback_datas(markup)
+        self.assertIn(f"admin:user_card:{USER_ID}", data)
+        self.assertIn("admin:user_profile", data)
+        self.assertIn("admin:send_user", data)
+
+    def test_recent_user_button_opens_profile(self):
+        bot.cb_admin_user_card(self.call(f"admin:user_card:{USER_ID}"))
+        self.assertIn("پروفایل کاربر", self.sent[-1][1])
+
+    def test_extra_admin_removal_requires_confirmation(self):
+        target_id = 828282
+        with (
+            mock.patch.object(bot, "ENV_ADMIN_ID_ORDER", (ADMIN_ID,)),
+            mock.patch.object(bot, "ENV_ADMIN_IDS", frozenset({ADMIN_ID})),
+        ):
+            bot.add_extra_admin(target_id, added_by=ADMIN_ID)
+
+            bot.cb_admin_adm_delete(self.call(f"admin:adm_del:{target_id}"))
+            self.assertIn(target_id, bot.ADMIN_IDS)
+            markup = bot.bot.edit_message_text.call_args.kwargs["reply_markup"]
+            self.assertIn(f"admin:adm_del_yes:{target_id}", callback_datas(markup))
+
+            bot.cb_admin_adm_delete_confirm(self.call(f"admin:adm_del_yes:{target_id}"))
+            self.assertNotIn(target_id, bot.ADMIN_IDS)
+
+    def test_broadcast_waits_for_confirmation_and_cancel_sends_nothing(self):
+        bot.set_admin_state(ADMIN_ID, "broadcast_text", {})
+        bot.admin_state_message(self.admin_message("Maintenance tonight"))
+        state = bot.get_admin_state(ADMIN_ID)
+        self.assertEqual(state["mode"], "broadcast_confirm")
+        self.assertIn("گیرندگان فعلی", self.sent[-1][1])
+        self.assertIn("Maintenance tonight", self.sent[-1][1])
+        self.assertIn("admin:broadcast:confirm", callback_datas(self.sent[-1][2]["reply_markup"]))
+
+        preview_id = bot.get_admin_state(ADMIN_ID)["data"]["preview_message_id"]
+        with mock.patch.object(bot, "broadcast_text") as send_broadcast:
+            bot.cb_admin_broadcast_confirmation(
+                self.call("admin:broadcast:cancel", message_id=preview_id)
+            )
+            send_broadcast.assert_not_called()
+        self.assertIsNone(bot.get_admin_state(ADMIN_ID))
+
+    def test_broadcast_confirmation_runs_once(self):
+        bot.set_admin_state(
+            ADMIN_ID,
+            "broadcast_confirm",
+            {"kind": "text", "text": "Notice", "source_chat_id": ADMIN_ID, "source_message_id": 99, "preview_message_id": 10},
+        )
+        with mock.patch.object(bot, "broadcast_text") as send_broadcast:
+            bot.cb_admin_broadcast_confirmation(self.call("admin:broadcast:confirm"))
+            send_broadcast.assert_called_once_with(ADMIN_ID, text="Notice")
+            bot.cb_admin_broadcast_confirmation(self.call("admin:broadcast:confirm"))
+            self.assertEqual(send_broadcast.call_count, 1)
+        self.assertIsNone(bot.get_admin_state(ADMIN_ID))
+
+    def test_stale_broadcast_button_cannot_cancel_a_new_preview(self):
+        bot.set_admin_state(
+            ADMIN_ID,
+            "broadcast_confirm",
+            {"kind": "text", "text": "new", "preview_message_id": 404},
+        )
+        bot.cb_admin_broadcast_confirmation(self.call("admin:broadcast:cancel", message_id=10))
+        self.assertEqual(bot.get_admin_state(ADMIN_ID)["mode"], "broadcast_confirm")
+        self.assertEqual(bot.get_admin_state(ADMIN_ID)["data"]["preview_message_id"], 404)
+
+    def test_forward_broadcast_keeps_source_message_reference_until_confirmed(self):
+        bot.set_admin_state(ADMIN_ID, "broadcast_forward", {})
+        message = self.admin_message(None, content_type="photo")
+        bot.admin_state_message(message)
+        data = bot.get_admin_state(ADMIN_ID)["data"]
+        self.assertEqual(data["kind"], "copy")
+        self.assertEqual(data["source_chat_id"], ADMIN_ID)
+        self.assertEqual(data["source_message_id"], message.message_id)
+        preview_id = data["preview_message_id"]
+
+        with mock.patch.object(bot, "broadcast_copy") as send_broadcast:
+            bot.cb_admin_broadcast_confirmation(
+                self.call("admin:broadcast:confirm", message_id=preview_id)
+            )
+            send_broadcast.assert_called_once_with(
+                ADMIN_ID,
+                source_chat_id=ADMIN_ID,
+                source_message_id=message.message_id,
+            )
+        self.assertIsNone(bot.get_admin_state(ADMIN_ID))
+
+    def test_monthly_v2ray_marketing_does_not_invent_location(self):
+        monthly = [p for p in bot.PRODUCT_INDEX.values() if p["id"].startswith("v2raym-")]
+        self.assertTrue(monthly)
+        for product in monthly:
+            self.assertNotIn("ترکیه", product["title"] + product["info"])
+            self.assertIn("تک‌سرور", product["info"])
+            self.assertTrue("پرسرعت" not in product["info"])
+            self.assertTrue("بدون قطعی" not in product["info"])
 
     def test_order_shortcut_and_wallet_shortcut(self):
         order_id = self.add_order(completed=NOW - timedelta(days=1))

@@ -2175,6 +2175,20 @@ def clear_admin_state(admin_id):
         )
 
 
+def claim_admin_state(admin_id, expected_mode, claimed_mode):
+    """Atomically claim an admin confirmation so duplicate taps run once."""
+    with db() as conn:
+        cur = conn.execute(
+            """
+            UPDATE admin_states
+            SET mode=?, updated_at=?
+            WHERE admin_id=? AND mode=?
+            """,
+            (claimed_mode, now(), admin_id, expected_mode),
+        )
+    return cur.rowcount == 1
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ACTIVE SERVICES
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3193,7 +3207,7 @@ def inline_server_menu():
             callback_data="srv:v2ray"
         ),
         types.InlineKeyboardButton(
-            "🇹🇷 V2Ray ماهیانه (۳۰ روزه)",
+            "🛜 V2Ray ماهیانه (۳۰ روزه)",
             callback_data="srv:v2raym"
         )
     )
@@ -3286,9 +3300,9 @@ def show_service_products(
 
         items = v2ray_monthly_items()
         title = (
-            "🇹🇷 <b>V2Ray ماهیانه — تک سرور ترکیه</b>\n\n"
+            "🛜 <b>V2Ray ماهیانه — تک‌سرور</b>\n\n"
             "⏱ اعتبار: <b>۳۰ روز</b>\n"
-            "⚡ تک سرور ترکیه، پرسرعت بدون قطعی\n"
+            "🛜 تک‌سرور؛ حجم و اعتبار مطابق پلن انتخابی\n"
             "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
             "برای خرید، حجم موردنظر را انتخاب کنید."
         )
@@ -8036,8 +8050,17 @@ def active_user_ids():
 
 def broadcast_copy(
     admin_id,
-    message
+    message=None,
+    *,
+    source_chat_id=None,
+    source_message_id=None,
 ):
+    if message is not None:
+        source_chat_id = message.chat.id
+        source_message_id = message.message_id
+    if source_chat_id is None or source_message_id is None:
+        raise ValueError("broadcast source message is missing")
+
     user_ids = active_user_ids()
 
     success = 0
@@ -8055,8 +8078,8 @@ def broadcast_copy(
 
             bot.copy_message(
                 user_id,
-                message.chat.id,
-                message.message_id
+                source_chat_id,
+                source_message_id
             )
 
             success += 1
@@ -8096,8 +8119,15 @@ def broadcast_copy(
 
 def broadcast_text(
     admin_id,
-    message
+    message=None,
+    *,
+    text=None,
 ):
+    if text is None:
+        text = message.text if message is not None else None
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("broadcast text is empty")
+
     user_ids = active_user_ids()
 
     success = 0
@@ -8115,7 +8145,7 @@ def broadcast_text(
 
             bot.send_message(
                 user_id,
-                message.text,
+                text,
                 parse_mode=None
             )
 
@@ -10244,7 +10274,7 @@ def cb_service_info(call):
     elif kind == "v2raym":
         text = (
             "ℹ️ <b>اطلاعات V2Ray ماهیانه</b>\n\n"
-            "⚡ تک سرور ترکیه، پرسرعت بدون قطعی\n"
+            "🛜 تک‌سرور؛ حجم و اعتبار مطابق پلن انتخابی\n"
             "⏱ اعتبار: ۳۰ روز\n"
             "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n"
             "📦 حجم‌ها: ۱۰، ۲۰، ۳۰، ۴۰، ۵۰، ۱۰۰ و ۲۰۰ گیگابایت\n\n"
@@ -13552,34 +13582,32 @@ def cb_admin_orders(call):
 def cb_admin_users(call):
     if call.from_user.id not in ADMIN_IDS:
         return
+    if not _admin_callback_is_private(call):
+        return
 
-    bot.answer_callback_query(
-        call.id
-    )
+    bot.answer_callback_query(call.id)
+    text = list_users_text()
+    if "هنوز کاربری ثبت نشده" not in text:
+        text += "\n\nبرای مشاهده پرونده، روی شناسه کاربر بزنید؛ با جستجو می‌توانید هر کاربر را پیدا کنید."
+    edit_or_send(call, text, admin_users_keyboard())
 
-    kb = types.InlineKeyboardMarkup(
-        row_width=1
-    )
 
-    kb.add(
-        types.InlineKeyboardButton(
-            "📨 ارسال پیام به کاربر",
-            callback_data="admin:send_user"
-        )
-    )
-
-    kb.add(
-        types.InlineKeyboardButton(
-            "⬅️ بازگشت به پنل",
-            callback_data="admin:home"
-        )
-    )
-
-    edit_or_send(
-        call,
-        list_users_text(),
-        kb
-    )
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:user_card:")
+)
+def cb_admin_user_card(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+    try:
+        user_id = int(call.data.split(":")[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "شناسه کاربر نامعتبر است.", show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    show_admin_user_profile(call.from_user.id, user_id)
 
 
 @bot.callback_query_handler(
@@ -13612,6 +13640,8 @@ def cb_admin_send_user(call):
 def cb_admin_broadcast_text(call):
     if call.from_user.id not in ADMIN_IDS:
         return
+    if not _admin_callback_is_private(call):
+        return
 
     bot.answer_callback_query(
         call.id
@@ -13635,6 +13665,8 @@ def cb_admin_broadcast_text(call):
 )
 def cb_admin_broadcast_forward(call):
     if call.from_user.id not in ADMIN_IDS:
+        return
+    if not _admin_callback_is_private(call):
         return
 
     bot.answer_callback_query(
@@ -15938,18 +15970,52 @@ def cb_admin_adm_delete(call):
         )
         return
 
-    remove_extra_admin(target_id)
+    if target_id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "این شناسه ادمین فعال نیست.", show_alert=True)
+        return
 
-    bot.answer_callback_query(
-        call.id,
-        "ادمین حذف شد ✅"
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton(
+            "✅ بله، حذف ادمین",
+            callback_data=f"admin:adm_del_yes:{target_id}"
+        ),
+        types.InlineKeyboardButton(
+            "❌ انصراف",
+            callback_data="admin:admins"
+        ),
     )
-
+    bot.answer_callback_query(call.id)
     edit_or_send(
         call,
-        admin_admins_text(),
-        admin_admins_keyboard()
+        f"⚠️ مطمئنید ادمین <code>{target_id}</code> از دسترسی مدیریت حذف شود؟",
+        kb,
     )
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data.startswith("admin:adm_del_yes:")
+)
+def cb_admin_adm_delete_confirm(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    try:
+        target_id = int(call.data.split(":")[-1])
+    except (TypeError, ValueError):
+        bot.answer_callback_query(call.id, "شناسه نامعتبر است.", show_alert=True)
+        return
+    if target_id in ENV_ADMIN_IDS:
+        bot.answer_callback_query(call.id, "ادمین پایه از پنل حذف نمی‌شود.", show_alert=True)
+        return
+    if target_id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "این ادمین قبلاً حذف شده است.", show_alert=True)
+        return
+
+    remove_extra_admin(target_id)
+    logger.warning("Admin %s removed extra admin %s", call.from_user.id, target_id)
+    bot.answer_callback_query(call.id, "ادمین حذف شد ✅")
+    edit_or_send(call, admin_admins_text(), admin_admins_keyboard())
 
 
 def handle_admin_add_message(message):
@@ -19647,20 +19713,39 @@ def admin_user_profile(user_id, now_dt=None):
 
 
 def admin_user_profile_keyboard(user_id, order_ids):
-    kb = types.InlineKeyboardMarkup(
-        row_width=3
-    )
+    kb = types.InlineKeyboardMarkup(row_width=3)
 
     if order_ids:
-        kb.add(
-            *[
-                types.InlineKeyboardButton(
-                    f"📅 #{order_id}",
-                    callback_data=f"admin:od:{order_id}"
-                )
-                for order_id in order_ids
-            ]
-        )
+        kb.add(*[
+            types.InlineKeyboardButton(
+                f"📦 {order_code(order_id)}",
+                callback_data=f"admin:dossier:o:{order_id}"
+            )
+            for order_id in order_ids
+        ])
+
+    with db() as conn:
+        service_rows = conn.execute(
+            """
+            SELECT id FROM active_services
+            WHERE user_id=?
+              AND service_type IN ('wireguard', 'v2ray')
+              AND service_username IS NOT NULL
+              AND TRIM(service_username) <> ''
+            ORDER BY started_at DESC
+            LIMIT 5
+            """,
+            (user_id,),
+        ).fetchall()
+
+    if service_rows:
+        kb.add(*[
+            types.InlineKeyboardButton(
+                f"🛠 {service_code(row['id'])}",
+                callback_data=f"admin:service_panel:{row['id']}"
+            )
+            for row in service_rows
+        ])
 
     kb.row(
         types.InlineKeyboardButton(
@@ -19668,7 +19753,6 @@ def admin_user_profile_keyboard(user_id, order_ids):
             callback_data=f"admin:uprof_wallet:{user_id}"
         )
     )
-
     kb.row(
         types.InlineKeyboardButton(
             "🔁 کاربر دیگر",
@@ -19679,8 +19763,60 @@ def admin_user_profile_keyboard(user_id, order_ids):
             callback_data="admin:home"
         )
     )
-
     return kb
+
+
+def admin_recent_user_rows(limit=10):
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, username, first_name
+            FROM users
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (max(1, min(int(limit), 50)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def admin_recent_user_ids(limit=10):
+    return [int(row['user_id']) for row in admin_recent_user_rows(limit)]
+
+
+def admin_users_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    for user in admin_recent_user_rows():
+        user_id = int(user['user_id'])
+        display = (user.get('first_name') or '').strip() or (f"@{user['username']}" if user.get('username') else str(user_id))
+        display = display[:18]
+        kb.add(types.InlineKeyboardButton(
+            f"👤 {display} · {user_id}", callback_data=f"admin:user_card:{user_id}"
+        ))
+    kb.row(types.InlineKeyboardButton(
+        "🔎 جستجوی هر کاربر", callback_data="admin:user_profile"
+    ))
+    kb.row(types.InlineKeyboardButton(
+        "📨 ارسال پیام به کاربر", callback_data="admin:send_user"
+    ))
+    kb.row(types.InlineKeyboardButton(
+        "⬅️ بازگشت به پنل", callback_data="admin:home"
+    ))
+    return kb
+
+
+def show_admin_user_profile(chat_id, user_id):
+    result = admin_user_profile(user_id)
+    if result is None:
+        bot.send_message(chat_id, "⚠️ کاربر پیدا نشد؛ فهرست را بروزرسانی کنید.")
+        return False
+    text, order_ids = result
+    bot.send_message(
+        chat_id,
+        text,
+        reply_markup=admin_user_profile_keyboard(user_id, order_ids),
+    )
+    return True
 
 
 @bot.callback_query_handler(
@@ -19688,6 +19824,8 @@ def admin_user_profile_keyboard(user_id, order_ids):
 )
 def cb_admin_user_profile(call):
     if call.from_user.id not in ADMIN_IDS:
+        return
+    if not _admin_callback_is_private(call):
         return
 
     set_admin_state(
@@ -19731,18 +19869,8 @@ def handle_user_profile_message(message):
         )
         return
 
-    text, order_ids = admin_user_profile(user["user_id"])
-
     clear_admin_state(admin_id)
-
-    bot.send_message(
-        message.chat.id,
-        text,
-        reply_markup=admin_user_profile_keyboard(
-            user["user_id"],
-            order_ids
-        )
-    )
+    show_admin_user_profile(message.chat.id, user["user_id"])
 
 
 @bot.callback_query_handler(
@@ -20140,6 +20268,138 @@ def cb_admin_sales(call):
     )
 
 
+def broadcast_confirmation_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        types.InlineKeyboardButton("✅ تأیید و ارسال همگانی", callback_data="admin:broadcast:confirm"),
+        types.InlineKeyboardButton("❌ لغو", callback_data="admin:broadcast:cancel"),
+    )
+    return kb
+
+
+def begin_broadcast_confirmation(message, kind):
+    if getattr(message.chat, "type", None) != "private":
+        bot.send_message(
+            message.chat.id,
+            "⚠️ برای جلوگیری از ارسال ناخواسته، آماده‌سازی پیام همگانی فقط در گفت‌وگوی خصوصی ادمین انجام می‌شود.",
+        )
+        return False
+
+    if kind == "text":
+        text = (message.text or "").strip()
+        if not text:
+            bot.send_message(message.chat.id, "❌ متن خالی است؛ پیام را دوباره بفرستید یا /cancel بزنید.")
+            return False
+        data = {
+            "kind": "text",
+            "text": text,
+            "source_chat_id": int(message.chat.id),
+            "source_message_id": int(message.message_id),
+        }
+    else:
+        data = {
+            "kind": "copy",
+            "source_chat_id": int(message.chat.id),
+            "source_message_id": int(message.message_id),
+            "content_type": str(message.content_type),
+        }
+
+    set_admin_state(message.from_user.id, "broadcast_confirm", data)
+    recipients = len(active_user_ids())
+    lines = [
+        "⚠️ <b>تأیید ارسال همگانی</b>",
+        "",
+        f"👥 گیرندگان فعلی: <b>{recipients:,}</b> کاربر فعال",
+        "📨 نوع پیام: " + ("متن" if kind == "text" else esc(data["content_type"])),
+    ]
+    if kind == "text":
+        preview = text[:900]
+        if len(text) > len(preview):
+            preview += "…"
+        lines += ["", "<b>پیش‌نمایش متن:</b>", f"<blockquote>{esc(preview)}</blockquote>"]
+    else:
+        lines += ["", "پیام/رسانه‌ی اصلی در همین گفت‌وگو بالاتر قابل مشاهده است."]
+    lines += ["", "ارسال فقط پس از زدن دکمه‌ی تأیید آغاز می‌شود. برای لغو، دکمه یا /cancel را بزنید."]
+    preview_message = bot.send_message(
+        message.chat.id,
+        "\n".join(lines),
+        reply_markup=broadcast_confirmation_keyboard(),
+    )
+    data["preview_message_id"] = int(preview_message.message_id)
+    update_admin_state(message.from_user.id, data)
+    return True
+
+
+@bot.callback_query_handler(
+    func=lambda c: c.data in {"admin:broadcast:confirm", "admin:broadcast:cancel"}
+)
+def cb_admin_broadcast_confirmation(call):
+    if call.from_user.id not in ADMIN_IDS:
+        bot.answer_callback_query(call.id, "دسترسی ندارید.", show_alert=True)
+        return
+    if not _admin_callback_is_private(call):
+        return
+
+    state = get_admin_state(call.from_user.id)
+    if not state or state.get("mode") != "broadcast_confirm":
+        bot.answer_callback_query(call.id, "این تأیید منقضی شده یا قبلاً استفاده شده است.", show_alert=True)
+        return
+    data = state.get("data") or {}
+    try:
+        is_current_preview = int(data.get("preview_message_id")) == int(call.message.message_id)
+    except (TypeError, ValueError, AttributeError):
+        is_current_preview = False
+    if not is_current_preview:
+        bot.answer_callback_query(call.id, "این دکمه برای پیش‌نمایش دیگری است و دیگر معتبر نیست.", show_alert=True)
+        return
+
+    if call.data.endswith(":cancel"):
+        if not claim_admin_state(call.from_user.id, "broadcast_confirm", "broadcast_cancelled"):
+            bot.answer_callback_query(call.id, "این درخواست قبلاً لغو یا اجرا شده است.", show_alert=True)
+            return
+        clear_admin_state(call.from_user.id)
+        bot.answer_callback_query(call.id, "ارسال لغو شد.")
+        edit_or_send(
+            call,
+            "✅ ارسال همگانی لغو شد؛ هیچ پیامی برای کاربران فرستاده نشد.",
+            admin_panel_keyboard(call.from_user.id, call.message.chat.id),
+        )
+        return
+
+    kind = data.get("kind")
+    if kind not in {"text", "copy"}:
+        clear_admin_state(call.from_user.id)
+        bot.answer_callback_query(call.id, "اطلاعات پیام معتبر نیست.", show_alert=True)
+        return
+    if not claim_admin_state(call.from_user.id, "broadcast_confirm", "broadcast_sending"):
+        bot.answer_callback_query(call.id, "ارسال قبلاً شروع شده یا این تأیید دیگر معتبر نیست.", show_alert=True)
+        return
+
+    bot.answer_callback_query(call.id, "ارسال شروع شد؛ گزارش نتیجه بعد از پایان می‌آید.")
+    try:
+        if kind == "text":
+            broadcast_text(call.from_user.id, text=data.get("text"))
+        else:
+            broadcast_copy(
+                call.from_user.id,
+                source_chat_id=int(data["source_chat_id"]),
+                source_message_id=int(data["source_message_id"]),
+            )
+    except Exception:
+        logger.exception("Confirmed broadcast failed for admin %s", call.from_user.id)
+        bot.send_message(call.from_user.id, "❌ ارسال همگانی به‌طور کامل اجرا نشد؛ گزارش خطا در ثبت رویدادها موجود است.")
+    finally:
+        clear_admin_state(call.from_user.id)
+        try:
+            bot.edit_message_reply_markup(
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ADMIN STATE MESSAGE HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
@@ -20171,6 +20431,17 @@ def admin_state_message(message):
         return
 
     mode = state["mode"]
+
+    if (
+        mode == "broadcast_sending"
+        and message.content_type == "text"
+        and (message.text or "").strip() == "/cancel"
+    ):
+        bot.send_message(
+            message.chat.id,
+            "⚠️ ارسال همگانی شروع شده و پس از آغاز قابل لغو نیست.",
+        )
+        return
 
     if (
         message.content_type == "text"
@@ -20761,28 +21032,18 @@ def admin_state_message(message):
 
             return
 
-        broadcast_text(
-            message.from_user.id,
-            message
-        )
-
-        clear_admin_state(
-            message.from_user.id
-        )
-
+        begin_broadcast_confirmation(message, "text")
         return
 
     if mode == "broadcast_forward":
+        begin_broadcast_confirmation(message, "copy")
+        return
 
-        broadcast_copy(
-            message.from_user.id,
-            message
+    if mode in {"broadcast_confirm", "broadcast_sending"}:
+        bot.send_message(
+            message.chat.id,
+            "برای ادامه از دکمه‌های تأیید/لغو پیام پیش‌نمایش استفاده کنید. اگر ارسال شروع شده، دیگر قابل لغو نیست.",
         )
-
-        clear_admin_state(
-            message.from_user.id
-        )
-
         return
 
     if mode == "admin_new_gmail":
@@ -22512,9 +22773,9 @@ def show_products_from_user(
 
         items = v2ray_monthly_items()
         text = (
-            "🇹🇷 <b>V2Ray ماهیانه — تک سرور ترکیه</b>\n\n"
+            "🛜 <b>V2Ray ماهیانه — تک‌سرور</b>\n\n"
             "⏱ اعتبار: <b>۳۰ روز</b>\n"
-            "⚡ تک سرور ترکیه، پرسرعت بدون قطعی\n"
+            "🛜 تک‌سرور؛ حجم و اعتبار مطابق پلن انتخابی\n"
             "💰 قیمت: هر گیگ ۶٬۰۰۰ تومان\n\n"
             "برای خرید، حجم موردنظر را انتخاب کنید."
         )
