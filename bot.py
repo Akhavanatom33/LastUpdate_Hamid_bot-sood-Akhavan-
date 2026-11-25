@@ -927,6 +927,32 @@ def init_db():
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS discount_coupons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                discount_type TEXT NOT NULL CHECK(discount_type IN ('percent','fixed')),
+                discount_value INTEGER NOT NULL CHECK(discount_value > 0),
+                min_order_amount INTEGER NOT NULL DEFAULT 0,
+                max_uses INTEGER NOT NULL DEFAULT 0,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS coupon_redemptions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                coupon_id INTEGER NOT NULL,
+                order_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                discount_amount INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'attempted',
+                created_at TEXT NOT NULL,
+                purchased_at TEXT,
+                UNIQUE(order_id),
+                FOREIGN KEY(coupon_id) REFERENCES discount_coupons(id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_coupon_redemptions_coupon
+            ON coupon_redemptions(coupon_id, status);
+
             CREATE INDEX IF NOT EXISTS idx_faq_items_order
             ON faq_items(sort_order);
 
@@ -1091,6 +1117,16 @@ def init_db():
             conn.execute(
                 "ALTER TABLE orders ADD COLUMN expired_at TEXT"
             )
+
+        for column, ddl in (("original_price", "INTEGER NOT NULL DEFAULT 0"),
+                            ("discount_amount", "INTEGER NOT NULL DEFAULT 0"),
+                            ("coupon_code", "TEXT")):
+            if column not in order_columns:
+                conn.execute(f"ALTER TABLE orders ADD COLUMN {column} {ddl}")
+        conn.execute("UPDATE orders SET original_price=price WHERE original_price=0 AND discount_amount=0")
+        coupon_columns = {row["name"] for row in conn.execute("PRAGMA table_info(discount_coupons)").fetchall()}
+        if "is_deleted" not in coupon_columns:
+            conn.execute("ALTER TABLE discount_coupons ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
 
         # یادداشت خصوصی ادمین روی سفارش (برای پیگیری)؛ فقط ادمین‌ها می‌بینند.
         for column in ("admin_note", "admin_note_updated_at"):
@@ -3616,6 +3652,12 @@ def invoice_text(
             "برای ادامه خرید، دکمه «پرداخت و ادامه» را زیر همین پیام بزنید."
         )
 
+    discount_lines = (
+        f"💰 قیمت قبل از تخفیف: <b>{money(int(order['original_price'] or price))}</b>\n"
+        f"🎁 کد تخفیف: <b>{esc(order['coupon_code'])}</b>\n"
+        f"🏷 میزان تخفیف: <b>{money(order['discount_amount'])}</b>\n"
+        if order["coupon_code"] else ""
+    )
     return (
         "🧾 <b>پیش‌فاکتور شما</b>\n"
         "━━━━━━━━━━━━━━━━━━\n"
@@ -3623,7 +3665,8 @@ def invoice_text(
         f"🛍 نوع سرویس: <b>{esc(plan_title)}</b>\n"
         f"📦 حجم / نوع: <b>{esc(volume)}</b>\n"
         f"{gmail_line}"
-        f"💰 قیمت نهایی: <b>{money(price)}</b>\n"
+        f"{discount_lines}"
+        f"💰 مبلغ نهایی: <b>{money(price)}</b>\n"
         f"{wallet_block}"
         "━━━━━━━━━━━━━━━━━━\n"
         f"{footer}"
@@ -3699,11 +3742,12 @@ def create_order(
                 wallet_reserved,
                 cash_required,
                 status,
+                original_price,
                 gmail_address,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -3713,6 +3757,7 @@ def create_order(
                 reserved,
                 cash_required,
                 "awaiting_payment",
+                int(product["price"]),
                 gmail_address,
                 t,
                 t
@@ -3930,6 +3975,8 @@ def finalize_wallet_only_order(
         if cur.rowcount != 1:
             return False
 
+        conn.execute("UPDATE coupon_redemptions SET status='purchased', purchased_at=? WHERE order_id=? AND status='attempted'", (now(), order_id))
+
         conn.execute(
             """
             INSERT INTO transactions(
@@ -4072,10 +4119,13 @@ def notify_admins_receipt(order_id):
             f"💵 مبلغ فیش ارسالی: <b>{money(cash_required)}</b>\n"
         )
 
+    coupon_block = (f"🎟 کد تخفیف: <b>{esc(order['coupon_code'])}</b>\n"
+                    f"💰 قیمت اولیه: <b>{money(order['original_price'] or price)}</b> | تخفیف: <b>{money(order['discount_amount'])}</b>\n" if order["coupon_code"] else "")
     text = (
         "💳 <b>فیش پرداخت جدید</b>\n\n"
         f"سفارش: <b>#{order_id}</b>\n"
         f"محصول: <b>{esc(order['product_title'])}</b>\n"
+        f"{coupon_block}"
         f"{wallet_block}"
         f"کاربر: <code>{order['user_id']}</code>"
         f"{gmail_line}"
@@ -4168,7 +4218,15 @@ def notify_fulfillment_admins(order_id):
         order["price"]
     )
 
-    if cash_required <= 0 and wallet_used > 0:
+    if cash_required <= 0 and price == 0:
+        payment_block = (
+            "🎁 نحوه پرداخت: <b>تخفیف ۱۰۰٪؛ بدون نیاز به واریز</b>\n"
+            f"💰 قیمت قبل از تخفیف: <b>{money(order['original_price'] or price)}</b>\n"
+            f"🎟 کد تخفیف: <b>{esc(order['coupon_code'] or '-')}</b>\n"
+            f"🏷 مبلغ تخفیف: <b>{money(order['discount_amount'] or 0)}</b>\n"
+        )
+
+    elif cash_required <= 0 and wallet_used > 0:
 
         payment_block = (
             "💳 نحوه پرداخت: <b>کیف پول (بدون فیش)</b>\n"
@@ -4195,10 +4253,13 @@ def notify_fulfillment_admins(order_id):
             f"💰 قیمت سرویس: <b>{money(price)}</b>\n"
         )
 
+    coupon_block = (f"🎟 کد تخفیف: <b>{esc(order['coupon_code'])}</b> | تخفیف: <b>{money(order['discount_amount'])}</b>\n"
+                    f"💰 قیمت اولیه: <b>{money(order['original_price'] or price)}</b>\n" if order["coupon_code"] else "")
     text = (
         "📦 <b>سفارش آماده تحویل</b>\n\n"
         f"سفارش: <b>#{order_id}</b>\n"
         f"محصول: <b>{esc(order['product_title'])}</b>\n"
+        f"{coupon_block}"
         f"{payment_block}"
         f"کاربر: <code>{order['user_id']}</code>"
         f"{gmail_line}"
@@ -4827,6 +4888,9 @@ def complete_order(order_id):
             """,
             (order_id,)
         ).fetchone()
+
+        if order and previous and previous["status"] != "completed":
+            conn.execute("UPDATE coupon_redemptions SET status='purchased', purchased_at=? WHERE order_id=? AND status='attempted'", (t, order_id))
 
         # سود اخوان فقط یک بار و فقط وقتی سفارش تازه تکمیل می‌شود ثبت می‌شود.
         if (
@@ -7139,6 +7203,173 @@ def admin_stats_keyboard():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# DISCOUNT COUPONS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_order_by_id(order_id):
+    with db() as conn:
+        return conn.execute("SELECT * FROM orders WHERE id=?", (order_id,)).fetchone()
+
+
+def apply_coupon_to_order(user_id, order_id, code):
+    code = (code or "").strip().upper()
+    if not code or len(code) > 64:
+        return False, "کد تخفیف معتبر نیست."
+    with db() as conn:
+        order = conn.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, user_id)).fetchone()
+        if not order or order["status"] != "awaiting_payment":
+            return False, "این سفارش در وضعیت قابل اعمال تخفیف نیست."
+        if order["coupon_code"]:
+            return False, "برای این سفارش قبلاً کد تخفیف اعمال شده است."
+        coupon = conn.execute("SELECT * FROM discount_coupons WHERE code=? COLLATE NOCASE AND is_deleted=0", (code,)).fetchone()
+        if not coupon or not coupon["is_active"]:
+            return False, "کد تخفیف وجود ندارد یا غیرفعال است."
+        if int(order["original_price"] or order["price"]) < int(coupon["min_order_amount"]):
+            return False, f"حداقل مبلغ خرید برای این کد {money(coupon['min_order_amount'])} است."
+        uses = conn.execute("SELECT COUNT(*) n FROM coupon_redemptions WHERE coupon_id=? AND status='purchased' ", (coupon["id"],)).fetchone()["n"]
+        if int(coupon["max_uses"] or 0) and uses >= int(coupon["max_uses"]):
+            return False, "ظرفیت استفاده از این کد تخفیف به پایان رسیده است."
+        original = int(order["original_price"] or order["price"])
+        if coupon["discount_type"] == "percent":
+            discount = original * int(coupon["discount_value"]) // 100
+        else:
+            discount = int(coupon["discount_value"])
+        discount = min(original, max(0, discount))
+        final_price = original - discount
+        old_reserved = int(order["wallet_reserved"] or 0)
+        user = conn.execute("SELECT balance FROM users WHERE user_id=?", (user_id,)).fetchone()
+        available = int(user["balance"] or 0) + old_reserved
+        new_reserved = min(available, final_price)
+        cash = final_price - new_reserved
+        t = now()
+        conn.execute("UPDATE users SET balance=?, updated_at=? WHERE user_id=?", (available-new_reserved, t, user_id))
+        conn.execute("UPDATE orders SET price=?, wallet_reserved=?, cash_required=?, discount_amount=?, coupon_code=?, updated_at=? WHERE id=? AND status='awaiting_payment'", (final_price, new_reserved, cash, discount, code, t, order_id))
+        conn.execute("INSERT INTO coupon_redemptions(coupon_id,order_id,user_id,discount_amount,status,created_at) VALUES(?,?,?,?, 'attempted', ?)", (coupon["id"], order_id, user_id, discount, t))
+        if old_reserved != new_reserved:
+            delta = new_reserved - old_reserved
+            conn.execute("INSERT INTO transactions(user_id,order_id,kind,amount,note,created_at) VALUES(?,?,?,?,?,?)", (user_id, order_id, "wallet_coupon_adjust", -delta, "تنظیم رزرو کیف پول پس از اعمال کد تخفیف", t))
+    return True, "تخفیف اعمال شد."
+
+
+def coupon_admin_keyboard():
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    kb.add(types.InlineKeyboardButton("➕ افزودن کد تخفیف", callback_data="admin:coupon_add"))
+    with db() as conn:
+        rows = conn.execute("SELECT id,code,is_active FROM discount_coupons WHERE is_deleted=0 ORDER BY id DESC LIMIT 40").fetchall()
+    for r in rows:
+        kb.add(types.InlineKeyboardButton(("🟢 " if r["is_active"] else "⚪ ")+r["code"], callback_data=f"admin:coupon_view:{r['id']}"))
+    kb.add(types.InlineKeyboardButton("⬅️ بازگشت به پنل", callback_data="admin:home"))
+    return kb
+
+
+def coupon_admin_text(coupon_id=None):
+    with db() as conn:
+        if coupon_id is None:
+            total = conn.execute("SELECT COUNT(*) FROM discount_coupons WHERE is_deleted=0").fetchone()[0]
+            active = conn.execute("SELECT COUNT(*) FROM discount_coupons WHERE is_active=1 AND is_deleted=0").fetchone()[0]
+            return f"🎟 <b>مدیریت کدهای تخفیف</b>\n\nتعداد کل: {total} | فعال: {active}\nبرای مشاهده جزئیات روی یک کد بزنید."
+        c = conn.execute("SELECT * FROM discount_coupons WHERE id=?", (coupon_id,)).fetchone()
+        if not c: return "کد تخفیف پیدا نشد."
+        stats = conn.execute("SELECT COUNT(*) attempts, SUM(CASE WHEN status='purchased' THEN 1 ELSE 0 END) purchased FROM coupon_redemptions WHERE coupon_id=?", (coupon_id,)).fetchone()
+    typ = "درصدی" if c["discount_type"] == "percent" else "مبلغ ثابت"
+    val = f"{c['discount_value']}٪" if c["discount_type"] == "percent" else money(c["discount_value"])
+    return (f"🎟 <b>کد تخفیف: {esc(c['code'])}</b>\n\nنوع: {typ}\nمقدار: {val}\nحداقل خرید: {money(c['min_order_amount'])}\nسقف استفاده: {c['max_uses'] or 'نامحدود'}\nوضعیت: {'فعال' if c['is_active'] else 'غیرفعال'}\n\n📥 دفعات ثبت/اعمال: {stats['attempts'] or 0}\n🛒 خریدهای تکمیل‌شده: {stats['purchased'] or 0}\n⏳ بدون خرید تکمیل‌شده: {int(stats['attempts'] or 0)-int(stats['purchased'] or 0)}")
+
+
+def handle_coupon_admin_input(message, state):
+    admin_id = message.from_user.id
+    if message.content_type != "text":
+        bot.send_message(message.chat.id, "لطفاً مقدار را به‌صورت متن ارسال کنید."); return
+    raw = (message.text or "").strip()
+    mode = state["mode"]
+    data = dict(state.get("data") or {})
+    if mode == "coupon_create_code":
+        code = raw.upper()
+        if len(code) < 3 or len(code) > 32 or not code.replace("-", "").replace("_", "").isalnum():
+            bot.send_message(message.chat.id, "کد باید ۳ تا ۳۲ حرف/عدد و بدون فاصله باشد."); return
+        with db() as conn:
+            exists = conn.execute("SELECT 1 FROM discount_coupons WHERE code=? COLLATE NOCASE AND is_deleted=0", (code,)).fetchone()
+        if exists:
+            bot.send_message(message.chat.id, "این کد قبلاً ثبت شده است. کد دیگری بفرستید."); return
+        data["code"] = code
+        set_admin_state(admin_id, "coupon_create_type", data)
+        kb=types.InlineKeyboardMarkup(row_width=2); kb.add(types.InlineKeyboardButton("درصدی",callback_data="admin:coupon_type:percent"),types.InlineKeyboardButton("مبلغ ثابت",callback_data="admin:coupon_type:fixed"))
+        bot.send_message(message.chat.id, "نوع تخفیف را انتخاب کنید:", reply_markup=kb); return
+    if mode == "coupon_create_value":
+        try: value=int(raw.translate(DIGIT_TRANSLATION).replace(",", ""))
+        except: bot.send_message(message.chat.id, "فقط عدد معتبر وارد کنید."); return
+        if value <= 0 or (data.get("type")=="percent" and value>100):
+            bot.send_message(message.chat.id, "مقدار درصد باید بین ۱ تا ۱۰۰ و مبلغ باید بیشتر از صفر باشد."); return
+        data["value"]=value; set_admin_state(admin_id,"coupon_create_min",data)
+        bot.send_message(message.chat.id,"حداقل مبلغ خرید را به تومان وارد کنید. عدد ۰ یعنی بدون محدودیت:"); return
+    if mode == "coupon_create_min":
+        try: minimum=int(raw.translate(DIGIT_TRANSLATION).replace(",", ""))
+        except: bot.send_message(message.chat.id,"فقط عدد معتبر وارد کنید."); return
+        if minimum<0: bot.send_message(message.chat.id,"عدد منفی مجاز نیست."); return
+        data["minimum"]=minimum; set_admin_state(admin_id,"coupon_create_max",data)
+        bot.send_message(message.chat.id,"حداکثر تعداد استفاده را وارد کنید. عدد ۰ یعنی نامحدود:"); return
+    if mode == "coupon_create_max":
+        try: maximum=int(raw.translate(DIGIT_TRANSLATION).replace(",", ""))
+        except: bot.send_message(message.chat.id,"فقط عدد معتبر وارد کنید."); return
+        if maximum<0: bot.send_message(message.chat.id,"عدد منفی مجاز نیست."); return
+        with db() as conn:
+            conn.execute("INSERT INTO discount_coupons(code,discount_type,discount_value,min_order_amount,max_uses,created_by,created_at) VALUES(?,?,?,?,?,?,?)",(data["code"],data["type"],data["value"],data["minimum"],maximum,admin_id,now()))
+        clear_admin_state(admin_id)
+        bot.send_message(message.chat.id,"✅ کد تخفیف ساخته شد.",reply_markup=coupon_admin_keyboard())
+
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin:coupons")
+def cb_admin_coupons(call):
+    if call.from_user.id not in ADMIN_IDS: return
+    bot.answer_callback_query(call.id)
+    edit_or_send(call,coupon_admin_text(),coupon_admin_keyboard())
+
+@bot.callback_query_handler(func=lambda c: c.data == "admin:coupon_add")
+def cb_admin_coupon_add(call):
+    if call.from_user.id not in ADMIN_IDS: return
+    set_admin_state(call.from_user.id,"coupon_create_code",{})
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id,"کد تخفیف دلخواه را ارسال کنید (۳ تا ۳۲ حرف/عدد):\nبرای لغو /cancel")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:coupon_type:"))
+def cb_admin_coupon_type(call):
+    if call.from_user.id not in ADMIN_IDS: return
+    typ=call.data.rsplit(":",1)[1]
+    if typ not in ("percent","fixed"): return
+    state=get_admin_state(call.from_user.id)
+    if not state or state["mode"]!="coupon_create_type": bot.answer_callback_query(call.id,"مرحله ساخت منقضی شده است.",show_alert=True); return
+    data=dict(state["data"]); data["type"]=typ; set_admin_state(call.from_user.id,"coupon_create_value",data)
+    bot.answer_callback_query(call.id); bot.send_message(call.message.chat.id,"مقدار تخفیف را وارد کنید:" + (" (درصد بین ۱ تا ۱۰۰)" if typ=="percent" else " (مبلغ به تومان)"))
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:coupon_view:"))
+def cb_admin_coupon_view(call):
+    if call.from_user.id not in ADMIN_IDS: return
+    try: cid=int(call.data.rsplit(":",1)[1])
+    except: return
+    with db() as conn: c=conn.execute("SELECT is_active FROM discount_coupons WHERE id=?",(cid,)).fetchone()
+    if not c: bot.answer_callback_query(call.id,"کد پیدا نشد.",show_alert=True); return
+    kb=types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("⏸ غیرفعال‌سازی" if c["is_active"] else "▶️ فعال‌سازی",callback_data=f"admin:coupon_toggle:{cid}"),types.InlineKeyboardButton("🗑 حذف",callback_data=f"admin:coupon_delete:{cid}"))
+    kb.add(types.InlineKeyboardButton("⬅️ فهرست کدها",callback_data="admin:coupons"))
+    bot.answer_callback_query(call.id); edit_or_send(call,coupon_admin_text(cid),kb)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:coupon_toggle:"))
+def cb_admin_coupon_toggle(call):
+    if call.from_user.id not in ADMIN_IDS: return
+    cid=int(call.data.rsplit(":",1)[1])
+    with db() as conn: conn.execute("UPDATE discount_coupons SET is_active=1-is_active WHERE id=?",(cid,))
+    bot.answer_callback_query(call.id,"وضعیت تغییر کرد."); edit_or_send(call,coupon_admin_text(cid),types.InlineKeyboardMarkup().add(types.InlineKeyboardButton("⬅️ بازگشت",callback_data=f"admin:coupon_view:{cid}")))
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin:coupon_delete:"))
+def cb_admin_coupon_delete(call):
+    if call.from_user.id not in ADMIN_IDS: return
+    cid=int(call.data.rsplit(":",1)[1])
+    with db() as conn:
+        conn.execute("UPDATE discount_coupons SET is_active=0, is_deleted=1 WHERE id=?",(cid,))
+    bot.answer_callback_query(call.id,"کد حذف شد."); edit_or_send(call,coupon_admin_text(),coupon_admin_keyboard())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # ADMIN PANEL
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -7199,6 +7430,13 @@ def admin_panel_keyboard(admin_id=None, chat_id=None):
         types.InlineKeyboardButton(
             "📤 ارسال دیتابیس",
             callback_data="admin:db_restore"
+        )
+    )
+
+    kb.row(
+        types.InlineKeyboardButton(
+            "🎟 مدیریت کدهای تخفیف",
+            callback_data="admin:coupons"
         )
     )
 
@@ -10517,15 +10755,18 @@ def cb_buy(call):
 # COUPON / PAYMENT
 # ══════════════════════════════════════════════════════════════════════════════
 
-@bot.callback_query_handler(
-    func=lambda c: c.data.startswith("coupon:")
-)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("coupon:"))
 def cb_coupon(call):
-    bot.answer_callback_query(
-        call.id,
-        "در حال حاضر امکان ثبت کد تخفیف فعال نشده است.",
-        show_alert=True
-    )
+    try: order_id = int(call.data.split(":", 1)[1])
+    except Exception:
+        bot.answer_callback_query(call.id, "شناسه سفارش نامعتبر است.", show_alert=True); return
+    with db() as conn:
+        order = conn.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (order_id, call.from_user.id)).fetchone()
+    if not order or order["status"] != "awaiting_payment":
+        bot.answer_callback_query(call.id, "برای این سفارش امکان ثبت کد تخفیف وجود ندارد.", show_alert=True); return
+    save_nav(call.from_user.id, "coupon_input", product_back_state(order["product_id"]), {"order_id": order_id})
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, f"🎁 کد تخفیف سفارش <b>#{order_id}</b> را ارسال کنید:\n\nبرای لغو، /cancel را بفرستید.")
 
 
 @bot.callback_query_handler(
@@ -12397,6 +12638,8 @@ def cb_receipt(call):
                     order_id
                 )
             )
+
+            conn.execute("UPDATE coupon_redemptions SET status='purchased', purchased_at=? WHERE order_id=? AND status='attempted'", (now(), order_id))
 
         bot.answer_callback_query(
             call.id,
@@ -17436,7 +17679,10 @@ def order_dates_report(order_id, now_dt=None):
             f"{service_code(order['renewal_for_service'])} است."
         )
 
-    lines.append(f"💰 مبلغ: {money(order['price'])}")
+    if order.get("coupon_code"):
+        lines.append(f"🎟 کد تخفیف: <b>{esc(order['coupon_code'])}</b> — تخفیف {money(order.get('discount_amount') or 0)}")
+        lines.append(f"💰 قیمت اولیه: {money(order.get('original_price') or order['price'])}")
+    lines.append(f"💰 مبلغ نهایی: {money(order['price'])}")
     lines.append("")
     lines.append(
         f"📝 ثبت سفارش: <b>{jalali_datetime_str(order['created_at'])}</b>"
@@ -18309,6 +18555,9 @@ def admin_order_dossier_sections(order_id, now_dt=None):
     finance = [
         "💰 <b>مالی</b>",
         f"   قیمت سفارش: <b>{money(order['price'])}</b>",
+        *([f"   قیمت اولیه: {money(order.get('original_price') or order['price'])}",
+           f"   کد تخفیف: <b>{esc(order.get('coupon_code'))}</b>",
+           f"   مبلغ تخفیف: {money(order.get('discount_amount') or 0)}"] if order.get("coupon_code") else []),
         f"   رزرو از کیف پول: {money(order.get('wallet_reserved') or 0)}",
         f"   مبلغ نقدی لازم: {money(order.get('cash_required') or 0)}",
         f"   پرداخت ثبت‌شده: {money(order.get('payment_amount') or 0)}",
@@ -20494,6 +20743,10 @@ def admin_state_message(message):
 
         return
 
+    if mode.startswith("coupon_create_"):
+        handle_coupon_admin_input(message, state)
+        return
+
     if mode == "price_edit":
 
         handle_price_edit_message(
@@ -21118,6 +21371,10 @@ def admin_state_message(message):
 )
 def cancel_command(message):
     if message.from_user.id not in ADMIN_IDS:
+        nav = get_nav(message.from_user.id)
+        if nav and nav.get("state") == "coupon_input":
+            save_nav(message.from_user.id, "invoice", nav.get("parent_state") or "home", nav.get("data") or {})
+            bot.send_message(message.chat.id, "✅ ورود کد تخفیف لغو شد.")
         return
 
     state = get_admin_state(
@@ -21162,6 +21419,23 @@ def user_text_router(message):
     nav = get_nav(
         message.from_user.id
     )
+
+    if nav["state"] == "coupon_input":
+        if (message.text or "").strip().lower() in {"/cancel", "لغو"}:
+            save_nav(message.from_user.id, "invoice", nav.get("parent_state") or "home", nav.get("data") or {})
+            bot.send_message(message.chat.id, "ورود کد تخفیف لغو شد.")
+            return
+        raw_code = (message.text or "").strip().upper()
+        order_id = int(nav.get("data", {}).get("order_id", 0))
+        result, detail = apply_coupon_to_order(message.from_user.id, order_id, raw_code)
+        if result:
+            order = get_order_by_id(order_id)
+            product = PRODUCT_INDEX.get(order["product_id"]) if order else None
+            save_nav(message.from_user.id, "invoice", product_back_state(order["product_id"]), {"order_id": order_id, "product_id": order["product_id"]})
+            bot.send_message(message.chat.id, "✅ کد تخفیف با موفقیت اعمال شد.\n\n" + invoice_text(order_id, product), reply_markup=invoice_keyboard(order_id))
+        else:
+            bot.send_message(message.chat.id, "❌ " + detail + "\nکد دیگری وارد کنید یا /cancel بزنید.")
+        return
 
     if nav["state"] in {"awaiting_service_username", "wireguard_trial_username"}:
         if not ensure_joined(message):
